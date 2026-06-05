@@ -131,8 +131,14 @@ pub struct FilesystemConfig {
     /// Single files with write-only access
     #[serde(default, deserialize_with = "deserialize_conditional_path_vec")]
     pub write_file: Vec<String>,
-    /// Single AF_UNIX socket paths — connect only.
-    /// Implies read access on the socket path. See issue #685.
+    /// Single AF_UNIX socket paths, connect only. nono's seccomp allowlist gates
+    /// the connect; the implied fs grant is read-only and only has to make the
+    /// socket path reachable. At the kernel level connect(2) checks MAY_WRITE on
+    /// the socket inode (unix_find_other -> inode_permission), but nono mediates
+    /// the syscall, so no fs write right is needed. See issue #685.
+    ///
+    /// Abstract-namespace sockets have no filesystem path and cannot be granted
+    /// through any `unix_socket*` field. The supervisor always denies them.
     #[serde(default, deserialize_with = "deserialize_conditional_path_vec")]
     pub unix_socket: Vec<String>,
     /// Single AF_UNIX socket paths — connect and bind.

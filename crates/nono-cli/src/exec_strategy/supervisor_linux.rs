@@ -800,10 +800,16 @@ fn canonicalize_unix_socket_bind_path(
 /// the sockaddr from the child's memory and delegates the allow/deny
 /// decision to [`decide_network_notification`].
 ///
-/// Denials return `EACCES` directly. Approvals currently use
-/// `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, which preserves platform compatibility
-/// but carries the documented userspace-pointer TOCTOU limitation described
-/// by `read_notif_sockaddr`.
+/// Denials return `EACCES` directly and are sound: the syscall never runs.
+///
+/// Approvals use `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, which lets the real syscall
+/// proceed. The kernel then re-reads the sockaddr from the child's memory, so a
+/// concurrent thread in the child can overwrite the path between our allowlist
+/// check and the kernel's read. The allowlist is therefore best-effort
+/// defense-in-depth for the connect/bind path, not an airtight boundary. There
+/// is no ADDFD-style fix for connect/bind on the child's own fd, so this is a
+/// known limitation rather than an oversight (see `read_notif_sockaddr` and the
+/// CONTINUE warning on `continue_notif`).
 pub(super) fn handle_network_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
@@ -889,6 +895,13 @@ fn record_af_unix_ipc_denial(
     let Some((display_path, op)) = path_record else {
         return;
     };
+    // This access mode tags the denied operation for the save flow; it is not
+    // the VFS permission the syscall needs. At the kernel level connect(2) to a
+    // pathname AF_UNIX socket checks MAY_WRITE on the socket inode
+    // (unix_find_other -> inode_permission), so connect is a write, not a read.
+    // nono mediates the connect through the seccomp allowlist, and the implied
+    // fs grant only has to make the socket path reachable, which Read covers.
+    // Bind additionally creates the inode, so it carries the broader ReadWrite.
     let access = match op {
         UnixSocketOp::Connect => AccessMode::Read,
         UnixSocketOp::Bind => AccessMode::ReadWrite,

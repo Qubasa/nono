@@ -91,6 +91,11 @@ pub struct PolicyExplanation {
     pub policy_source: Option<String>,
     /// Suggested CLI flag to fix (e.g. "--read ~/.ssh/id_rsa").
     pub suggested_flag: Option<String>,
+    /// The denial came from an `AF_UNIX` socket connect/bind, not a regular
+    /// file access. Carried from the supervisor's `UnixSocketDenied` record so
+    /// the save flow can route the grant to the dedicated `unix_socket` fields
+    /// even when the socket path does not exist yet (the normal `bind(2)` case).
+    pub is_socket: bool,
 }
 
 /// Path-level hint extracted from a command's own error output.
@@ -3185,6 +3190,7 @@ mod tests {
                 details: None,
                 policy_source: None,
                 suggested_flag: Some(format!("--read {}", denied.display())),
+                is_socket: false,
             }]);
         let output = formatter.format_footer(1);
 
@@ -3847,6 +3853,7 @@ mod tests {
             details: None,
             policy_source: None,
             suggested_flag: None,
+            is_socket: false,
         };
         let denials = vec![DenialRecord {
             path: denied,

@@ -1372,13 +1372,14 @@ fn build_policy_explanations(
 ) -> Vec<nono::diagnostic::PolicyExplanation> {
     use nono::AccessMode;
     use nono::diagnostic::PolicyExplanation;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     // Merge access modes per path so a path denied for both Read and Write
     // produces a single ReadWrite query. Querying each (path, mode) pair
     // independently would let the first insert win and drop the other mode,
     // yielding an incomplete "Fix:" suggestion.
     let mut paths: BTreeMap<std::path::PathBuf, AccessMode> = BTreeMap::new();
+    let mut socket_paths: BTreeSet<std::path::PathBuf> = BTreeSet::new();
 
     let merge = |existing: AccessMode, incoming: AccessMode| -> AccessMode {
         if existing == incoming {
@@ -1389,6 +1390,9 @@ fn build_policy_explanations(
     };
 
     for denial in denials {
+        if denial.reason == DenialReason::UnixSocketDenied {
+            socket_paths.insert(denial.path.clone());
+        }
         paths
             .entry(denial.path.clone())
             .and_modify(|a| *a = merge(*a, denial.access))
@@ -1429,6 +1433,7 @@ fn build_policy_explanations(
                 ..
             }) => {
                 explanations.push(PolicyExplanation {
+                    is_socket: socket_paths.contains(&path),
                     path,
                     access,
                     reason,
@@ -1438,8 +1443,23 @@ fn build_policy_explanations(
                 });
             }
             Ok(crate::query_ext::QueryResult::Allowed { .. }) => {
-                // Path is actually allowed by policy — the denial came from
-                // a different layer (e.g. Landlock timing). Skip.
+                // A unix socket connect/bind is blocked by seccomp even when the
+                // path carries an fs grant, so a query that reports "allowed"
+                // does not mean the operation succeeds. Still emit the denial so
+                // the save flow can offer the dedicated unix_socket grant.
+                if socket_paths.contains(&path) {
+                    explanations.push(PolicyExplanation {
+                        is_socket: true,
+                        path,
+                        access,
+                        reason: "path_not_granted".to_string(),
+                        details: None,
+                        policy_source: None,
+                        suggested_flag: None,
+                    });
+                }
+                // Otherwise the denial came from a different layer (e.g.
+                // Landlock timing) and the path is genuinely allowed. Skip.
             }
             Ok(crate::query_ext::QueryResult::NotSandboxed { .. })
             | Ok(crate::query_ext::QueryResult::Scope { .. })
@@ -3631,6 +3651,7 @@ mod tests {
             details: None,
             policy_source: None,
             suggested_flag: Some("--read-file /tmp/secret.txt".to_string()),
+            is_socket: false,
         }];
         let observation = nono::diagnostic::ErrorObservation::default();
 
@@ -3641,6 +3662,39 @@ mod tests {
             &observation,
             &[],
         ));
+    }
+
+    #[test]
+    fn build_policy_explanations_emits_socket_grant_even_when_fs_allows_path() {
+        use nono::diagnostic::{DenialReason, DenialRecord};
+        use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let resolved = dir.path().canonicalize().expect("canonicalize");
+        let socket_path = resolved.join("agent.sock");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: resolved.clone(),
+            resolved: resolved.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        // The fs grant covers the socket path, so query_path reports Allowed,
+        // yet the connect was blocked by seccomp for lack of a unix-socket grant.
+        let denials = vec![DenialRecord {
+            path: socket_path.clone(),
+            access: AccessMode::Read,
+            reason: DenialReason::UnixSocketDenied,
+        }];
+
+        let explanations = build_policy_explanations(&denials, &[], &caps);
+
+        assert_eq!(explanations.len(), 1);
+        assert!(explanations[0].is_socket);
+        assert_eq!(explanations[0].path, socket_path);
     }
 
     #[test]
