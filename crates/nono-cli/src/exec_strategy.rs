@@ -3151,7 +3151,6 @@ fn run_supervisor_loop(
                 drain_pending_network_notifications(
                     proxy_notify_raw_fd,
                     config,
-                    &mut rate_limiter,
                     &mut denials.fs,
                     &mut ipc_denials,
                 );
@@ -3163,7 +3162,6 @@ fn run_supervisor_loop(
                 drain_pending_network_notifications(
                     proxy_notify_raw_fd,
                     config,
-                    &mut rate_limiter,
                     &mut denials.fs,
                     &mut ipc_denials,
                 );
@@ -3191,7 +3189,6 @@ fn run_supervisor_loop(
 fn drain_pending_network_notifications(
     proxy_notify_raw_fd: Option<std::os::fd::RawFd>,
     config: &SupervisorConfig<'_>,
-    rate_limiter: &mut supervisor_linux::RateLimiter,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) {
@@ -3209,13 +3206,9 @@ fn drain_pending_network_notifications(
         if ret <= 0 || pfd.revents & libc::POLLIN == 0 {
             return;
         }
-        if let Err(err) = supervisor_linux::handle_network_notification(
-            fd,
-            config,
-            rate_limiter,
-            denials,
-            ipc_denials,
-        ) {
+        if let Err(err) =
+            supervisor_linux::handle_network_notification(fd, config, denials, ipc_denials)
+        {
             debug!("Error draining pending proxy seccomp notification: {}", err);
             return;
         }

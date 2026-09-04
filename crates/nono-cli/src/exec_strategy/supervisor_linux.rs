@@ -1011,39 +1011,32 @@ pub(super) fn handle_combined_notification(
             notif,
         )
     } else {
-        handle_received_network_notification(
-            notify_fd,
-            config,
-            state.rate_limiter,
-            state.denials,
-            ipc_denials,
-            notif,
-        )
+        handle_received_network_notification(notify_fd, config, state.denials, ipc_denials, notif)
     }
 }
 
 pub(super) fn handle_network_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
-    rate_limiter: &mut RateLimiter,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) -> nono::error::Result<()> {
     let notif = nono::sandbox::recv_notif(notify_fd)?;
-    handle_received_network_notification(
-        notify_fd,
-        config,
-        rate_limiter,
-        denials,
-        ipc_denials,
-        notif,
-    )
+    handle_received_network_notification(notify_fd, config, denials, ipc_denials, notif)
 }
 
+/// Handle a received connect()/bind()/send\* notification.
+///
+/// Deliberately not rate limited. [`RateLimiter`] exists to keep a compromised
+/// child from flooding the terminal with approval prompts, and
+/// [`decide_network_notification`] is a pure capability lookup that never
+/// prompts. Spending a token here bought no containment — a child cannot
+/// provoke more supervisor work than its own syscall throughput allows — while
+/// turning a granted `bind()` into a silent `EPERM` as soon as the burst was
+/// exhausted. Chromium alone issues far more than the burst during startup.
 fn handle_received_network_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
-    rate_limiter: &mut RateLimiter,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
     notif: nono::sandbox::SeccompNotif,
@@ -1191,9 +1184,8 @@ fn handle_received_network_notification(
     // The BPF filter traps by syscall number and cannot distinguish address
     // families, so every mode receives sockaddrs it does not mediate: TCP/UDP
     // in AF_UNIX-only mode, and AF_UNIX in proxy-only mode without
-    // `linux.af_unix_mediation`. Those carry no policy decision — pass them
-    // through without consuming a rate-limiter token, which would otherwise
-    // starve legitimate traffic once the burst is exhausted.
+    // `linux.af_unix_mediation`. Those carry no policy decision, so pass them
+    // straight through.
     if sockaddrs
         .iter()
         .all(|s| network_notification_out_of_scope(config.seccomp_policy, s.family))
@@ -1202,14 +1194,6 @@ fn handle_received_network_notification(
             debug!("continue_notif failed for out-of-scope pass-through: {}", e);
             return deny_notif(notify_fd, notif.id);
         }
-        return Ok(());
-    }
-
-    // Rate limit: guard AF_UNIX mediation decisions and proxy-mode decisions
-    // against notification flooding from a compromised child.
-    if !rate_limiter.try_acquire() {
-        debug!("Rate limited network seccomp notification, denying");
-        let _ = deny_notif(notify_fd, notif.id);
         return Ok(());
     }
 
