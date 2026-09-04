@@ -24,21 +24,51 @@ fn short_tempdir() -> tempfile::TempDir {
         .expect("tempdir in /tmp")
 }
 
-/// Absolute path to a system `python3` (under a default-allowed bin dir),
-/// preferred over a pyenv/asdf shim: shims re-exec the real interpreter from a
-/// dir the sandbox doesn't grant, so the child fails to exec (exit 127).
+/// Absolute path to a `python3` the sandbox can exec.
+///
+/// System locations come first: a pyenv/asdf shim re-execs the real
+/// interpreter from a dir the sandbox doesn't grant, so the child fails to
+/// exec (exit 127). Distros without `/usr/bin` (NixOS) resolve from `PATH`
+/// instead, where the interpreter lives under a granted runtime root.
 fn python3_bin() -> Option<String> {
-    for cand in ["/usr/bin/python3", "/bin/python3", "/usr/local/bin/python3"] {
-        let runnable = Command::new(cand)
+    let mut candidates: Vec<std::path::PathBuf> =
+        ["/usr/bin/python3", "/bin/python3", "/usr/local/bin/python3"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("python3")));
+    }
+
+    for cand in candidates {
+        // nono resolves the binary before exec, so a path it cannot
+        // canonicalize is useless even when a shell can run it.
+        let Ok(cand) = std::fs::canonicalize(&cand) else {
+            continue;
+        };
+        let runnable = Command::new(&cand)
             .args(["-c", "import socket"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         if runnable {
-            return Some(cand.to_string());
+            return Some(cand.to_string_lossy().into_owned());
         }
     }
     None
+}
+
+/// Profile fragment granting the interpreter's own runtime paths.
+///
+/// A Nix-store `python3` loads its stdlib and libc from `/nix/store`, which
+/// the default system paths do not cover; a distro interpreter under
+/// `/usr/bin` needs nothing extra.
+fn interpreter_groups(py: &str) -> &'static str {
+    if py.starts_with("/nix/store/") {
+        r#""groups":{"include":["nix_runtime"]},"#
+    } else {
+        ""
+    }
 }
 
 #[test]
@@ -56,7 +86,10 @@ fn af_unix_mediation_pathname_blocks_connect_to_unlisted_socket() {
 
     let profile = t.write_profile(
         "af-unix-test",
-        r#"{"meta":{"name":"af-unix-test"},"workdir":{"access":"readwrite"},"linux":{"af_unix_mediation":"pathname"}}"#,
+        &format!(
+            r#"{{{groups}"meta":{{"name":"af-unix-test"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}}}}"#,
+            groups = interpreter_groups(&py)
+        ),
     );
 
     let socket_arg = socket_path.to_string_lossy().into_owned();
@@ -97,7 +130,8 @@ fn af_unix_mediation_pathname_allows_connect_to_listed_socket() {
     let profile = t.write_profile(
         "af-unix-allow-test",
         &format!(
-            r#"{{"meta":{{"name":"af-unix-allow-test"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}},"filesystem":{{"unix_socket":["{socket_arg}"]}}}}"#
+            r#"{{{groups}"meta":{{"name":"af-unix-allow-test"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}},"filesystem":{{"unix_socket":["{socket_arg}"]}}}}"#,
+            groups = interpreter_groups(&py)
         ),
     );
 
@@ -134,7 +168,8 @@ fn filesystem_deny_blocks_unix_socket_connect_on_macos() {
     let profile = t.write_profile(
         "macos-socket-deny",
         &format!(
-            r#"{{"meta":{{"name":"macos-socket-deny"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"deny":["{socket_arg}"]}}}}"#
+            r#"{{{groups}"meta":{{"name":"macos-socket-deny"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"deny":["{socket_arg}"]}}}}"#,
+            groups = interpreter_groups(&py)
         ),
     );
 
@@ -188,7 +223,10 @@ fn af_unix_mediation_pathname_allows_orphaned_child_tcp_connect() {
 
     let profile = t.write_profile(
         "af-unix-orphan",
-        r#"{"meta":{"name":"af-unix-orphan"},"workdir":{"access":"readwrite"},"network":{"block":false},"linux":{"af_unix_mediation":"pathname"}}"#,
+        &format!(
+            r#"{{{groups}"meta":{{"name":"af-unix-orphan"}},"workdir":{{"access":"readwrite"}},"network":{{"block":false}},"linux":{{"af_unix_mediation":"pathname"}}}}"#,
+            groups = interpreter_groups(&py)
+        ),
     );
 
     // Foreground connect (always in the supervisor's ancestry) then a
