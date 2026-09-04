@@ -161,6 +161,21 @@ When enabled, pathname AF_UNIX sockets are default-deny and must match explicit
 `filesystem.unix_socket*` grants. Broad filesystem read/write grants no longer
 imply permission to talk to every socket under those paths.
 
+No capability can grant the abstract namespace. Abstract addresses
+(`sun_path[0] == '\0'`) and unnamed AF_UNIX addresses carry no filesystem path,
+so `filesystem.unix_socket*` cannot describe them. Under `pathname` mediation
+both are denied with `EACCES` and reported as IPC denials naming the socket
+kind. With mediation off, their containment is `security.ipc_mode` scoping
+above: the default `shared_memory_only` keeps abstract sockets created outside
+the sandbox unreachable on V6 kernels, and `ipc_mode: "full"` is the explicit
+opt-out. On kernels whose Landlock ABI predates abstract socket scoping, the
+scope is reported as requested but not enforced.
+
+Every supervisor-issued AF_UNIX denial leaves a record. Policy denials answer
+`EACCES`; `EPERM` means the supervisor could not mediate the call at all (for
+example it could not read the address out of the child). A denied socket is
+therefore attributable from the session footer without tracing the child.
+
 Allowed pathname sockets are resumed through Linux seccomp user notification.
 Because seccomp receives the syscall before the kernel copies `sockaddr_un`
 from userspace, a multi-threaded sandboxed process can race an allowed

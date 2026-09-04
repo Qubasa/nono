@@ -515,16 +515,7 @@ fn handle_received_filesystem_notification(
     }
 
     // 6. Rate limit check
-    if !rate_limiter.try_acquire() {
-        debug!("Rate limited seccomp notification for {}", path.display());
-        record_denial(
-            denials,
-            DenialRecord {
-                path: canonicalized.clone(),
-                access,
-                reason: DenialReason::RateLimited,
-            },
-        );
+    if !charge_openat_rate_limit(rate_limiter, &canonicalized, access, denials) {
         let _ = deny_notif(notify_fd, notif.id);
         return Ok(());
     }
@@ -664,6 +655,36 @@ fn handle_received_filesystem_notification(
     }
 
     Ok(())
+}
+
+/// Charge the approval-path token bucket for one `openat` notification.
+///
+/// Returns `false` once the bucket is empty, after recording the denial, so
+/// the caller answers the child. Split out from the response plumbing so the
+/// flood guard is testable without a live seccomp-notify fd.
+///
+/// The network handler has no counterpart on purpose: see
+/// [`handle_network_notification`].
+fn charge_openat_rate_limit(
+    rate_limiter: &mut RateLimiter,
+    path: &std::path::Path,
+    access: AccessMode,
+    denials: &mut Vec<DenialRecord>,
+) -> bool {
+    if rate_limiter.try_acquire() {
+        return true;
+    }
+
+    debug!("Rate limited seccomp notification for {}", path.display());
+    record_denial(
+        denials,
+        DenialRecord {
+            path: path.to_path_buf(),
+            access,
+            reason: DenialReason::RateLimited,
+        },
+    );
+    false
 }
 
 /// Decision produced by [`decide_network_notification`].
@@ -982,10 +1003,12 @@ fn canonicalize_unix_socket_bind_path(
 /// the sockaddr from the child's memory and delegates the allow/deny
 /// decision to [`decide_network_notification`].
 ///
-/// Denials return `EACCES` directly. Approvals currently use
-/// `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, which preserves platform compatibility
-/// but carries the documented userspace-pointer TOCTOU limitation described
-/// by `read_notif_sockaddr`.
+/// Policy denials answer `EACCES`; a supervisor-side failure to mediate the
+/// call answers `EPERM` via `deny_notif`, so the errno tells the two apart.
+/// Either way the denial leaves a record, so no call is denied on a `debug!`
+/// alone. Approvals currently use `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, which
+/// preserves platform compatibility but carries the documented
+/// userspace-pointer TOCTOU limitation described by `read_notif_sockaddr`.
 pub(super) fn handle_combined_notification(
     notify_fd: std::os::fd::RawFd,
     child: Pid,
@@ -1065,6 +1088,11 @@ fn handle_received_network_notification(
                         "Failed to read sockaddr from seccomp notification (nr={}): {}",
                         notif.data.nr, e
                     );
+                    record_network_mediation_failure(
+                        ipc_denials,
+                        notif.data.nr,
+                        &format!("could not read the socket address: {e}"),
+                    );
                     let _ = deny_notif(notify_fd, notif.id);
                     return Ok(());
                 }
@@ -1088,6 +1116,11 @@ fn handle_received_network_notification(
                         "Failed to read sendto sockaddr from seccomp notification: {}",
                         e
                     );
+                    record_network_mediation_failure(
+                        ipc_denials,
+                        notif.data.nr,
+                        &format!("could not read the sendto destination address: {e}"),
+                    );
                     let _ = deny_notif(notify_fd, notif.id);
                     return Ok(());
                 }
@@ -1104,6 +1137,11 @@ fn handle_received_network_notification(
                             debug!(
                                 "Failed to read sendmsg sockaddr from seccomp notification: {}",
                                 e
+                            );
+                            record_network_mediation_failure(
+                                ipc_denials,
+                                notif.data.nr,
+                                &format!("could not read the sendmsg destination address: {e}"),
                             );
                             let _ = deny_notif(notify_fd, notif.id);
                             return Ok(());
@@ -1124,6 +1162,11 @@ fn handle_received_network_notification(
                         "Failed to read msghdr from sendmsg seccomp notification: {}",
                         e
                     );
+                    record_network_mediation_failure(
+                        ipc_denials,
+                        notif.data.nr,
+                        &format!("could not read the sendmsg message header: {e}"),
+                    );
                     let _ = deny_notif(notify_fd, notif.id);
                     return Ok(());
                 }
@@ -1137,6 +1180,11 @@ fn handle_received_network_notification(
                     debug!(
                         "Failed to read sendmmsg message vector from seccomp notification: {}",
                         e
+                    );
+                    record_network_mediation_failure(
+                        ipc_denials,
+                        notif.data.nr,
+                        &format!("could not read the sendmmsg message vector: {e}"),
                     );
                     let _ = deny_notif(notify_fd, notif.id);
                     return Ok(());
@@ -1152,6 +1200,14 @@ fn handle_received_network_notification(
                     Ok(info) => sockaddrs.push(info),
                     Err(e) => {
                         debug!("Failed to read sendmmsg sockaddr at message {}: {}", idx, e);
+                        record_network_mediation_failure(
+                            ipc_denials,
+                            notif.data.nr,
+                            &format!(
+                                "could not read the sendmmsg destination address \
+                                 at message {idx}: {e}"
+                            ),
+                        );
                         let _ = deny_notif(notify_fd, notif.id);
                         return Ok(());
                     }
@@ -1175,6 +1231,11 @@ fn handle_received_network_notification(
             warn!(
                 "Unexpected syscall {} in network seccomp handler, denying",
                 other
+            );
+            record_network_mediation_failure(
+                ipc_denials,
+                other,
+                "syscall is not mediated by the network handler",
             );
             let _ = deny_notif(notify_fd, notif.id);
             return Ok(());
@@ -1207,7 +1268,14 @@ fn handle_received_network_notification(
         match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
             NetworkDecision::Allow => {}
             NetworkDecision::Deny => {
-                record_af_unix_ipc_denial(sockaddr, notif.pid, notif.data.nr, denials, ipc_denials);
+                record_af_unix_ipc_denial(
+                    sockaddr,
+                    notif.pid,
+                    notif.data.nr,
+                    config,
+                    denials,
+                    ipc_denials,
+                );
                 respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
                 if let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr) {
                     warn!("Failed to record network denial audit event: {}", err);
@@ -1227,10 +1295,38 @@ fn handle_received_network_notification(
     Ok(())
 }
 
+/// Record a supervisor-side failure to mediate a network notification.
+///
+/// These answer the child `EPERM` (never `EACCES`, which is reserved for
+/// policy denials) and are unattributable to an address family, because the
+/// address is exactly what could not be read. They still get a record so the
+/// child's failed syscall is explainable without tracing it.
+///
+/// Only failures that actually deny the child belong here. A `continue_notif`
+/// that fails did not deny anything: the notification is orphaned or expired,
+/// and recording it would invent a denial the child never saw.
+fn record_network_mediation_failure(
+    ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+    syscall: i32,
+    detail: &str,
+) {
+    let operation = unix_socket_op_for_syscall(syscall)
+        .map(|op| op.to_string())
+        .unwrap_or_else(|| format!("syscall {syscall}"));
+
+    ipc_denials.push(nono::diagnostic::IpcDenialRecord::new(
+        "socket:<address unavailable>".to_string(),
+        operation,
+        format!("supervisor could not mediate the call: {detail}"),
+        None,
+    ));
+}
+
 fn record_af_unix_ipc_denial(
     sockaddr: &nono::sandbox::SockaddrInfo,
     child_pid: u32,
     syscall: i32,
+    config: &SupervisorConfig<'_>,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) {
@@ -1242,7 +1338,8 @@ fn record_af_unix_ipc_denial(
     let operation = op
         .map(|op| op.to_string())
         .unwrap_or_else(|| format!("syscall {syscall}"));
-    let (target, reason, remediation, path_record) = ipc_denial_details(sockaddr, child_pid, op);
+    let (target, reason, remediation, path_record) =
+        ipc_denial_details(sockaddr, child_pid, op, config);
 
     ipc_denials.push(nono::diagnostic::IpcDenialRecord::new(
         target,
@@ -1275,6 +1372,7 @@ fn ipc_denial_details(
     sockaddr: &nono::sandbox::SockaddrInfo,
     child_pid: u32,
     op: Option<UnixSocketOp>,
+    config: &SupervisorConfig<'_>,
 ) -> (String, String, Option<NonoRemediation>, PathIpcDenial) {
     match sockaddr.unix_kind {
         Some(nono::sandbox::UnixSocketKind::Pathname) => {
@@ -1296,20 +1394,35 @@ fn ipc_denial_details(
             };
             let resolved = resolve_af_unix_sockaddr_path(child_pid, path)
                 .unwrap_or_else(|_| path.to_path_buf());
+            let bind = matches!(op, UnixSocketOp::Bind);
             let canonical = match op {
                 UnixSocketOp::Connect | UnixSocketOp::Send => resolved.canonicalize(),
                 UnixSocketOp::Bind => canonicalize_unix_socket_bind_path(&resolved),
             };
+            // A path that cannot be canonicalized is still denied fail-closed and
+            // still recorded, under the uncanonicalized path. The allowlist check
+            // only picks the wording: a covered path that failed to resolve is a
+            // socket that does not exist yet, not a missing grant, and suggesting
+            // a grant flag for it would send the user after a phantom.
             let Ok(display_path) = canonical else {
+                let covered =
+                    unix_socket_allowlist_allows(config.unix_socket_allowlist, &resolved, op);
+                let reason = if covered {
+                    "target could not be canonicalized; a unix_socket capability already \
+                     covers this path, so the socket most likely does not exist yet"
+                } else {
+                    "no matching unix_socket capability; target could not be canonicalized"
+                };
                 return (
                     resolved.display().to_string(),
-                    "no matching unix_socket capability; target could not be canonicalized"
-                        .to_string(),
-                    None,
-                    None,
+                    reason.to_string(),
+                    (!covered).then(|| NonoRemediation::GrantUnixSocket {
+                        path: resolved.clone(),
+                        bind,
+                    }),
+                    Some((resolved, op)),
                 );
             };
-            let bind = matches!(op, UnixSocketOp::Bind);
             (
                 display_path.display().to_string(),
                 "no matching unix_socket capability".to_string(),
@@ -1535,6 +1648,36 @@ mod tests {
         assert!(!limiter.try_acquire());
         limiter.last_refill -= std::time::Duration::from_millis(500);
         assert!(limiter.try_acquire());
+    }
+
+    /// The approval path keeps its flood guard: once the burst is spent, the
+    /// `openat` notification is denied *and* recorded as rate limited, so the
+    /// suppressed approval prompt is still attributable.
+    #[test]
+    fn openat_flooding_records_rate_limited_denial() {
+        let mut limiter = RateLimiter::new(10, 2);
+        let mut denials = Vec::new();
+        let path = PathBuf::from("/tmp/nono-approval-flood-probe");
+
+        for _ in 0..2 {
+            assert!(charge_openat_rate_limit(
+                &mut limiter,
+                &path,
+                AccessMode::Read,
+                &mut denials
+            ));
+        }
+        assert!(denials.is_empty(), "burst must not record denials");
+
+        assert!(!charge_openat_rate_limit(
+            &mut limiter,
+            &path,
+            AccessMode::Read,
+            &mut denials
+        ));
+        assert_eq!(denials.len(), 1, "flooded openat left no denial record");
+        assert_eq!(denials[0].reason, DenialReason::RateLimited);
+        assert_eq!(denials[0].path, path);
     }
 
     #[test]
@@ -2480,6 +2623,129 @@ mod tests {
                 decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49160), &config),
                 NetworkDecision::Allow
             );
+        }
+
+        /// No AF_UNIX denial may be silent, whatever the socket kind: a
+        /// pathname socket also carries a filesystem denial record and the
+        /// grant flag that would allow it, while abstract and unnamed sockets
+        /// carry only the IPC record, since no pathname capability can name
+        /// them.
+        #[test]
+        fn every_af_unix_denial_leaves_a_record() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "ungranted.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let config = make_af_unix_only_config(&backend, &[]);
+
+            for (kind, sockaddr) in [
+                ("pathname", unix_pathname(&path)),
+                ("abstract", unix_abstract()),
+                ("unnamed", unix_unnamed()),
+            ] {
+                assert_eq!(
+                    decide_network_notification(test_pid(), SYS_CONNECT, &sockaddr, &config),
+                    NetworkDecision::Deny,
+                    "{kind} connect must be denied under pathname mediation"
+                );
+
+                let mut denials = Vec::new();
+                let mut ipc_denials = Vec::new();
+                super::super::record_af_unix_ipc_denial(
+                    &sockaddr,
+                    test_pid(),
+                    SYS_CONNECT,
+                    &config,
+                    &mut denials,
+                    &mut ipc_denials,
+                );
+
+                assert_eq!(ipc_denials.len(), 1, "{kind} denial left no IPC record");
+                assert_eq!(ipc_denials[0].operation, "connect");
+
+                if kind == "pathname" {
+                    let canonical = path.canonicalize().expect("canonicalize socket path");
+                    assert_eq!(ipc_denials[0].target, canonical.display().to_string());
+                    assert!(
+                        matches!(
+                            ipc_denials[0].remediation,
+                            Some(nono::NonoRemediation::GrantUnixSocket { bind: false, .. })
+                        ),
+                        "pathname denial must suggest a connect grant: {:?}",
+                        ipc_denials[0].remediation
+                    );
+                    assert_eq!(denials.len(), 1, "pathname denial left no path record");
+                    assert_eq!(denials[0].path, canonical);
+                    assert_eq!(
+                        denials[0].reason,
+                        super::super::DenialReason::UnixSocketDenied
+                    );
+                } else {
+                    assert!(
+                        denials.is_empty(),
+                        "{kind} socket has no path to record a filesystem denial for"
+                    );
+                    assert!(
+                        ipc_denials[0].target.starts_with("unix:<"),
+                        "{kind} denial must name the socket kind: {}",
+                        ipc_denials[0].target
+                    );
+                }
+            }
+        }
+
+        /// A socket path the supervisor cannot canonicalize is denied
+        /// fail-closed, and the denial is still recorded under the
+        /// uncanonicalized path rather than vanishing into a debug log.
+        #[test]
+        fn uncanonicalizable_denial_is_recorded_without_a_phantom_grant() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let missing = dir.path().join("not-yet").join("broker.sock");
+
+            // Ungranted and unresolvable: the record carries the grant flag.
+            let config = make_af_unix_only_config(&backend, &[]);
+            let mut denials = Vec::new();
+            let mut ipc_denials = Vec::new();
+            super::super::record_af_unix_ipc_denial(
+                &unix_pathname(&missing),
+                test_pid(),
+                SYS_CONNECT,
+                &config,
+                &mut denials,
+                &mut ipc_denials,
+            );
+            assert_eq!(ipc_denials.len(), 1);
+            assert_eq!(ipc_denials[0].target, missing.display().to_string());
+            assert!(ipc_denials[0].remediation.is_some());
+            assert_eq!(denials.len(), 1, "unresolvable path left no denial record");
+            assert_eq!(denials[0].path, missing);
+
+            // Already granted through a subtree: the socket simply does not
+            // exist yet, so suggesting a grant would send the user after a
+            // phantom.
+            let allowlist = vec![
+                UnixSocketCapability::new_dir_subtree(dir.path(), UnixSocketMode::ConnectBind)
+                    .expect("subtree grant"),
+            ];
+            let granted = make_af_unix_only_config(&backend, &allowlist);
+            let mut denials = Vec::new();
+            let mut ipc_denials = Vec::new();
+            super::super::record_af_unix_ipc_denial(
+                &unix_pathname(&missing),
+                test_pid(),
+                SYS_CONNECT,
+                &granted,
+                &mut denials,
+                &mut ipc_denials,
+            );
+            assert_eq!(ipc_denials.len(), 1);
+            assert!(
+                ipc_denials[0].remediation.is_none(),
+                "a covered path must not be reported as a missing grant: {:?}",
+                ipc_denials[0].remediation
+            );
+            assert_eq!(denials.len(), 1);
         }
     }
 }

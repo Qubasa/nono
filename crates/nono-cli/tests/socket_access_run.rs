@@ -10,8 +10,10 @@ use nono_test_support::{Argv, nono_test};
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::os::unix::net::UnixDatagram;
+use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::UnixListener;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::process::Command;
 
 // Socket paths must stay under the 104-byte SUN_LEN limit; use /tmp directly
@@ -266,6 +268,230 @@ print(os.read(r, 200).decode(), flush=True)
         .assert_stdout_contains("orphan OK")
         // Fingerprint of the ancestry-gated /proc/<pid>/mem read failing.
         .assert_stderr_lacks("Failed to read sockaddr");
+}
+
+/// Regression test for the rate-limited AF_UNIX decision path: the supervisor
+/// charged a shared `RateLimiter(10, 5)` token bucket on every AF_UNIX
+/// notification *before* the capability lookup, so a burst of connects to an
+/// explicitly granted socket died at the burst capacity. Measured on the
+/// pre-change binary: `ok=5 errs=[1]` (35 x `EPERM`), timing dependent, with
+/// no denial record to explain it.
+#[test]
+#[cfg(target_os = "linux")]
+fn af_unix_mediation_pathname_allows_connect_burst_to_listed_socket() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("af-unix-burst");
+    let sock_tmp = short_tempdir();
+    let socket_path = sock_tmp.path().join("burst.sock");
+    let _listener = UnixDatagram::bind(&socket_path).expect("bind test datagram socket");
+
+    let socket_arg = socket_path.to_string_lossy().into_owned();
+    let profile = t.write_profile(
+        "af-unix-burst",
+        &format!(
+            r#"{{{groups}"meta":{{"name":"af-unix-burst"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}},"filesystem":{{"unix_socket":["{socket_arg}"]}}}}"#,
+            groups = interpreter_groups(&py)
+        ),
+    );
+
+    // SOCK_DGRAM connect() only sets the peer address, so each iteration is a
+    // single mediated syscall with no handshake to wait on.
+    let py_script = format!(
+        r#"
+import socket
+P = {socket_arg:?}
+ok = 0
+errs = []
+for _ in range(40):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        s.connect(P)
+        ok += 1
+    except OSError as e:
+        errs.append(e.errno)
+    finally:
+        s.close()
+print("ok=%d errs=%s" % (ok, sorted(set(errs))), flush=True)
+"#
+    );
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        .assert_stdout_contains("ok=40 errs=[]");
+}
+
+/// The broker shape every supervised background process needs: a daemon binds
+/// a runtime-chosen path inside a granted subtree, whose parent directory is
+/// created after the sandbox started, and a sibling process connects to it. A
+/// bind the profile does not cover is still denied, with a record naming it.
+#[test]
+#[cfg(target_os = "linux")]
+fn af_unix_mediation_pathname_allows_bind_in_granted_subtree() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("af-unix-subtree-bind");
+    let sock_tmp = short_tempdir();
+    let subtree_arg = sock_tmp.path().to_string_lossy().into_owned();
+    // Writable but covered by no socket capability, so the bind reaches the
+    // mediation decision instead of a filesystem denial. Short path: the
+    // workspace dir would exceed the SUN_LEN limit.
+    let no_grant_tmp = short_tempdir();
+    let no_grant_dir = no_grant_tmp.path().to_string_lossy().into_owned();
+    let ungranted_arg = no_grant_tmp
+        .path()
+        .join("nogrant.sock")
+        .to_string_lossy()
+        .into_owned();
+
+    let profile = t.write_profile(
+        "af-unix-subtree-bind",
+        &format!(
+            r#"{{{groups}"meta":{{"name":"af-unix-subtree-bind"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}},"filesystem":{{"unix_socket_subtree_bind":["{subtree_arg}"],"allow":["{no_grant_dir}"]}}}}"#,
+            groups = interpreter_groups(&py)
+        ),
+    );
+
+    let py_script = format!(
+        r#"
+import os, socket
+d = os.path.join({subtree_arg:?}, "run-7f3a")
+os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "broker.sock")
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(p)
+srv.listen(1)
+print("bound", flush=True)
+pid = os.fork()
+if pid == 0:
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        c.connect(p)
+        os._exit(0)
+    except OSError as e:
+        os._exit(e.errno or 1)
+conn, _ = srv.accept()
+_, status = os.waitpid(pid, 0)
+print("client=%d" % (status >> 8), flush=True)
+outside = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    outside.bind({ungranted_arg:?})
+    print("outside=allowed", flush=True)
+except OSError as e:
+    print("outside=errno%d" % e.errno, flush=True)
+"#
+    );
+
+    let completed = t
+        .run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        .assert_stdout_contains("bound")
+        .assert_stdout_contains("client=0")
+        // EACCES: a policy denial, never the supervisor's EPERM.
+        .assert_stdout_contains("outside=errno13");
+
+    let stderr = completed.stderr();
+    assert!(
+        stderr.contains("nogrant.sock"),
+        "ungranted bind must be recorded by name\nstderr: {stderr}",
+    );
+}
+
+/// Abstract-namespace containment, which no pathname capability can express:
+/// with the default `ipc_mode`, Landlock scoping bounds abstract sockets to
+/// the sandbox, and `ipc_mode = "full"` is the explicit opt-out. Pinned here
+/// so a change to the mediation path cannot silently regress it.
+#[test]
+#[cfg(target_os = "linux")]
+fn abstract_unix_sockets_are_scoped_to_the_sandbox_by_default() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    let scoping = nono::Sandbox::detect_abi()
+        .map(|abi| abi.has_scoping())
+        .unwrap_or(false);
+    if !scoping {
+        eprintln!("skipping: kernel Landlock ABI predates abstract socket scoping");
+        return;
+    }
+
+    let t = nono_test!("abstract-unix-scope");
+    let name = format!("nono-abstract-{}", std::process::id());
+    let addr = SocketAddr::from_abstract_name(name.as_bytes()).expect("abstract socket address");
+    let _host_listener = UnixListener::bind_addr(&addr).expect("bind host abstract listener");
+
+    let scoped = t.write_profile(
+        "abstract-scoped",
+        &format!(
+            r#"{{{groups}"meta":{{"name":"abstract-scoped"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"off"}}}}"#,
+            groups = interpreter_groups(&py)
+        ),
+    );
+    let full_ipc = t.write_profile(
+        "abstract-full-ipc",
+        &format!(
+            r#"{{{groups}"meta":{{"name":"abstract-full-ipc"}},"workdir":{{"access":"readwrite"}},"security":{{"ipc_mode":"full"}},"linux":{{"af_unix_mediation":"off"}}}}"#,
+            groups = interpreter_groups(&py)
+        ),
+    );
+
+    let host_connect = format!(
+        r#"
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect(b"\0{name}")
+    print("host=connected", flush=True)
+except OSError as e:
+    print("host=errno%d" % e.errno, flush=True)
+"#
+    );
+
+    // A socket bound outside the sandbox is unreachable: EPERM from scoping.
+    t.run()
+        .profile(&scoped)
+        .exec(Argv::new(&py).arg("-c").arg(&host_connect))
+        .assert_stdout_contains("host=errno1");
+
+    // Scoping bounds the domain rather than banning the namespace, so an
+    // in-sandbox abstract socket still works.
+    let inside = r#"
+import os, socket
+NAME = b"\0nono-inside-%d" % os.getpid()
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(NAME)
+srv.listen(1)
+pid = os.fork()
+if pid == 0:
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        c.connect(NAME)
+        os._exit(0)
+    except OSError as e:
+        os._exit(e.errno or 1)
+conn, _ = srv.accept()
+_, status = os.waitpid(pid, 0)
+print("inside=%d" % (status >> 8), flush=True)
+"#;
+    t.run()
+        .profile(&scoped)
+        .exec(Argv::new(&py).arg("-c").arg(inside))
+        .assert_stdout_contains("inside=0");
+
+    // ipc_mode = "full" is the documented opt-out.
+    t.run()
+        .profile(&full_ipc)
+        .exec(Argv::new(&py).arg("-c").arg(&host_connect))
+        .assert_stdout_contains("host=connected");
 }
 
 /// Regression test for issue #1901: a profile that only sets

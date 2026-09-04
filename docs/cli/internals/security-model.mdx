@@ -134,11 +134,11 @@ Because `stat` and `access` are not trapped, the sandboxed child can enumerate f
 | Failure | Behavior | Safety Property |
 |---------|----------|-----------------|
 | Supervisor crashes | Notif fd closes; pending syscalls get `ENOSYS`; child falls back to Landlock | Safe — Landlock denies the access |
-| Supervisor denies request | Child receives `EPERM` | Safe — explicit denial |
+| Supervisor denies request | Policy denials: child receives `EACCES`. Supervisor could not mediate the call: `EPERM` | Safe — explicit denial, recorded either way |
 | Protected-root match | Request rejected before approval backend is consulted | Safe — protects internal nono state |
 | Rate limit exceeded | Approval request automatically denied | Safe — prevents prompt flooding. Applies only to the `openat` approval path; AF_UNIX and proxy decisions are pure capability lookups that never prompt, so they are not rate limited |
 | Child exits during approval | `SECCOMP_IOCTL_NOTIF_ID_VALID` check fails; supervisor discards the request | Safe — no orphaned state |
-| Path canonicalization fails | Supervisor returns error to child | Safe — fail-closed |
+| Path canonicalization fails | Supervisor denies the call and records the denial under the uncanonicalized path | Safe — fail-closed |
 
 The invariant is: **if anything goes wrong, the child does not get access**. The system fails closed at every decision point.
 
