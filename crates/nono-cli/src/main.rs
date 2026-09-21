@@ -12,6 +12,7 @@ mod audit_integrity;
 mod audit_ledger;
 mod audit_session;
 mod capability_ext;
+mod child_reaper;
 mod cli;
 mod cli_bootstrap;
 mod command_blocking_deprecation;

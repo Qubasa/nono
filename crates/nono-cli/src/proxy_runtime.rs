@@ -451,7 +451,9 @@ impl ProxyCredentialCaptureBackend {
             command.env_remove(name);
         }
 
-        let mut child = command.spawn().map_err(|err| {
+        // Registered against the supervisor's orphan drain, which would
+        // otherwise reap this status out from under the wait below.
+        let mut child = crate::child_reaper::spawn_owned(&mut command).map_err(|err| {
             self.capture_error(
                 entry,
                 CaptureErrorDetails::new("spawn_failed", start.elapsed())
@@ -2005,18 +2007,20 @@ fn load_command_credential_source(
         command,
         outer_caps,
     );
-    let mut child = Command::new(command)
+    let mut spawned = Command::new(command);
+    spawned
         .args(args)
         .env("PATH", &safe_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            NonoError::SandboxInit(format!(
-                "failed to start supervisor credential source '{command}': {err}"
-            ))
-        })?;
+        .stderr(Stdio::piped());
+    // Same reason as the capture path: the orphan drain must not take this
+    // status before the wait below does.
+    let mut child = crate::child_reaper::spawn_owned(&mut spawned).map_err(|err| {
+        NonoError::SandboxInit(format!(
+            "failed to start supervisor credential source '{command}': {err}"
+        ))
+    })?;
 
     let start = Instant::now();
     loop {

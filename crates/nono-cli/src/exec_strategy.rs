@@ -21,6 +21,8 @@ use crate::startup_prompt::{notify_startup_termination_for_child, print_terminal
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
 use nix::sys::signal::{self, Signal};
+#[cfg(target_os = "linux")]
+use nix::sys::wait::{Id, waitid};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
 use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, SupervisorResponse};
@@ -2779,26 +2781,53 @@ type SupervisorLoopResult = (
 /// `waitpid(-1, WNOHANG)` returns only terminated children, so a live child is
 /// never consumed. If the primary `child` is reaped here, its status is
 /// returned rather than dropped.
+///
+/// Every status is peeked with `WNOWAIT` first, because proxy threads in this
+/// same process spawn and wait on their own children (credential capture
+/// commands). Consuming one of those leaves its `try_wait()` with `ECHILD` and
+/// fails the intercepted request. Such a pid is left in place, which also ends
+/// the drain: `waitpid(-1)` would keep returning it. Its owner reaps within a
+/// poll interval and the next pass continues.
 #[cfg(target_os = "linux")]
 fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
-    loop {
-        match waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
-            Ok(status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _))) => {
-                if pid == child {
-                    return Some(status);
+    crate::child_reaper::with_owned(|owned| {
+        loop {
+            // waitid, not waitpid: WNOWAIT is a waitid-only flag and wait4
+            // rejects it with EINVAL.
+            let peeked = match waitid(
+                Id::All,
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            ) {
+                Ok(WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)) => pid,
+                // Nothing reapable now; no WSTOPPED/WCONTINUED, so ignore stop/continue.
+                Ok(_) => return None,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(nix::errno::Errno::ECHILD) => return None,
+                Err(e) => {
+                    debug!("waitid(P_ALL) during orphan reap failed: {}", e);
+                    return None;
                 }
-                debug!("Reaped reparented orphan {}", pid);
-            }
-            // Nothing reapable now; no WUNTRACED/WCONTINUED, so ignore stop/continue.
-            Ok(_) => return None,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(nix::errno::Errno::ECHILD) => return None,
-            Err(e) => {
-                debug!("waitpid(-1) during orphan reap failed: {}", e);
+            };
+            if u32::try_from(peeked.as_raw()).is_ok_and(|pid| owned.contains(&pid)) {
                 return None;
             }
+            match waitpid(Some(peeked), Some(WaitPidFlag::WNOHANG)) {
+                Ok(status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _))) => {
+                    if pid == child {
+                        return Some(status);
+                    }
+                    debug!("Reaped reparented orphan {}", pid);
+                }
+                Ok(_) => return None,
+                // Raced with the thread that owns it; nothing left to collect.
+                Err(nix::errno::Errno::EINTR | nix::errno::Errno::ECHILD) => continue,
+                Err(e) => {
+                    debug!("waitpid({}) during orphan reap failed: {}", peeked, e);
+                    return None;
+                }
+            }
         }
-    }
+    })
 }
 
 /// Supervisor IPC event loop for capability expansion (Linux).
@@ -5980,5 +6009,56 @@ mod tests {
 
         let result = validate_url("data:text/html,<script>alert(1)</script>", &config);
         assert!(result.is_err(), "data: URLs must be rejected");
+    }
+
+    /// Block until `pid` is a zombie, without consuming its status.
+    #[cfg(target_os = "linux")]
+    fn await_zombie(pid: Pid) {
+        for _ in 0..500 {
+            match waitid(
+                Id::Pid(pid),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            ) {
+                Ok(WaitStatus::StillAlive) => std::thread::sleep(Duration::from_millis(2)),
+                Ok(_) => return,
+                Err(e) => panic!("peek on {pid} failed: {e}"),
+            }
+        }
+        panic!("{pid} never exited");
+    }
+
+    /// The supervisor subreaps orphans while proxy threads in the same process
+    /// spawn and wait on credential capture commands. Draining one of those
+    /// leaves its owner with ECHILD, which surfaces as a 503 on an otherwise
+    /// working credential route.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orphan_drain_skips_children_owned_by_this_process() {
+        let mut spawned = Command::new("/bin/sh");
+        spawned.args(["-c", "exit 0"]);
+        let mut stray = spawned.spawn().expect("spawn stray child");
+        await_zombie(Pid::from_raw(
+            i32::try_from(stray.id()).expect("pid fits i32"),
+        ));
+
+        assert!(
+            reap_reparented_orphans(Pid::from_raw(i32::MAX)).is_none(),
+            "the sentinel primary child is never among the orphans"
+        );
+        assert!(
+            stray.try_wait().is_err(),
+            "an unowned orphan must still be reaped by the drain"
+        );
+
+        let mut spawned = Command::new("/bin/sh");
+        spawned.args(["-c", "exit 7"]);
+        let mut owned = crate::child_reaper::spawn_owned(&mut spawned).expect("spawn owned child");
+        await_zombie(Pid::from_raw(
+            i32::try_from(owned.id()).expect("pid fits i32"),
+        ));
+
+        assert!(reap_reparented_orphans(Pid::from_raw(i32::MAX)).is_none());
+        let status = owned.wait().expect("owner must still reap its own child");
+        assert_eq!(status.code(), Some(7));
     }
 }
