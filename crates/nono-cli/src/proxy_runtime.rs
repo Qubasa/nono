@@ -2412,17 +2412,12 @@ pub(crate) fn build_proxy_config_from_flags(
         .unwrap_or(&[]);
     let (mut plain_hosts, _) =
         network_policy::partition_allow_domain(&net_policy, plain_allow_domain)?;
-    // Port-exact, and therefore appended *after* partitioning: going through
-    // `expand_proxy_allow` would strip the ":port" that makes the allowance
-    // name one service rather than a whole host. No bare-host fallback for
-    // the same reason.
     let ssh_hosts = proxy
         .domain_filter
         .as_ref()
         .map(|d| network_policy::ssh_allowlist_entries(&d.allow_ssh))
         .transpose()?
         .unwrap_or_default();
-    plain_hosts.extend(ssh_hosts.iter().cloned());
 
     let endpoint_allow_domain = proxy
         .endpoint_filter
@@ -2440,6 +2435,16 @@ pub(crate) fn build_proxy_config_from_flags(
         || !resolved.suffixes.is_empty()
         || !plain_hosts.is_empty()
         || !endpoint_routes.is_empty();
+
+    // Port-exact, and therefore appended *after* partitioning: going through
+    // `expand_proxy_allow` would strip the ":port" that makes the allowance
+    // name one service rather than a whole host. Only onto an allowlist that
+    // is already filtering, for the #1485 reason above: on an open policy
+    // these entries would be the whole allowlist and SSH would become the
+    // only reachable destination.
+    if host_allowlist_active {
+        plain_hosts.extend(ssh_hosts);
+    }
 
     // Endpoint-restricted domains need filter allowlist access so the proxy
     // can reach upstream after TLS interception (h2 checks the filter at
@@ -3170,7 +3175,7 @@ pub(crate) fn start_proxy_runtime(
             ))
         })?;
         let files = crate::ssh_client::prepare_ssh_client_files(&nono_exe)?;
-        grant_ssh_client_access(caps, &files)?;
+        grant_ssh_client_access(caps, &files, &nono_exe)?;
         env_vars.push(("GIT_SSH_COMMAND".to_string(), files.git_ssh_command()));
         Some(files)
     } else {
@@ -3192,11 +3197,16 @@ pub(crate) fn start_proxy_runtime(
 /// generated SSH config and wrapper. Mirrors the TLS-intercept bundle grant:
 /// both live under the protected `~/.nono` root, which on macOS needs
 /// action-matching platform rules to override the `file-read-data` deny.
+///
+/// `nono_exe` is granted for the same reason: the generated config's
+/// `ProxyCommand` runs that binary, and it is only reachable by accident when
+/// it happens to sit in an already-granted prefix such as the Nix store.
 fn grant_ssh_client_access(
     caps: &mut CapabilitySet,
     files: &crate::ssh_client::SshClientFiles,
+    nono_exe: &std::path::Path,
 ) -> Result<()> {
-    let mut paths = vec![files.config_path()];
+    let mut paths = vec![files.config_path(), nono_exe];
     paths.extend(files.wrapper_path());
     for path in paths {
         #[cfg(target_os = "macos")]
@@ -3649,10 +3659,19 @@ mod tests {
     }
 
     fn ssh_only_proxy(allow_ssh: &[&str]) -> ProxyLaunchOptions {
+        filtered_proxy(&[], allow_ssh)
+    }
+
+    /// `allow_domain` makes the allowlist the thing that decides egress, which
+    /// is the only state in which an `allow_ssh` entry is added to it.
+    fn filtered_proxy(allow_domain: &[&str], allow_ssh: &[&str]) -> ProxyLaunchOptions {
         ProxyLaunchOptions {
             domain_filter: Some(DomainFilterIntent {
                 network_profile: None,
-                allow_domain: Vec::new(),
+                allow_domain: allow_domain
+                    .iter()
+                    .map(|d| crate::profile::AllowDomainEntry::Plain((*d).to_string()))
+                    .collect(),
                 deny_domain: Vec::new(),
                 allow_ssh: allow_ssh.iter().map(|s| (*s).to_string()).collect(),
             }),
@@ -3662,7 +3681,8 @@ mod tests {
 
     #[test]
     fn test_allow_ssh_is_port_exact_in_the_allowlist() -> Result<()> {
-        let config = build_proxy_config_from_flags(&ssh_only_proxy(&["deploy@build.example.com"]))?;
+        let proxy = filtered_proxy(&["api.example.com"], &["deploy@build.example.com"]);
+        let config = build_proxy_config_from_flags(&proxy)?;
 
         assert!(
             config
@@ -3683,12 +3703,17 @@ mod tests {
         Ok(())
     }
 
-    /// #1485: an empty allowlist means allow-all downstream, so an SSH-only
-    /// run must not leave the list empty.
+    /// #1485: an empty allowlist is allow-all downstream, so writing the SSH
+    /// endpoint into it would make SSH the only reachable destination and cut
+    /// off every other host the run was already free to use.
     #[test]
-    fn test_allow_ssh_only_run_keeps_the_host_allowlist_active() -> Result<()> {
+    fn test_allow_ssh_does_not_narrow_an_open_policy() -> Result<()> {
         let config = build_proxy_config_from_flags(&ssh_only_proxy(&["build.example.com:2222"]))?;
-        assert_eq!(config.allowed_hosts, vec!["build.example.com:2222"]);
+        assert!(
+            config.allowed_hosts.is_empty(),
+            "allow_ssh must not turn an open network policy into an allowlist, got {:?}",
+            config.allowed_hosts
+        );
         Ok(())
     }
 
@@ -3696,7 +3721,8 @@ mod tests {
     /// allowed port is reachable and every other port on the same host is not.
     #[test]
     fn test_allow_ssh_allowlist_refuses_other_ports_and_hosts() -> Result<()> {
-        let config = build_proxy_config_from_flags(&ssh_only_proxy(&["localhost:2222"]))?;
+        let proxy = filtered_proxy(&["api.example.com"], &["localhost:2222"]);
+        let config = build_proxy_config_from_flags(&proxy)?;
         let filter = nono_proxy::filter::ProxyFilter::new(&config.allowed_hosts);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

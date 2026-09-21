@@ -678,7 +678,10 @@ mod tests {
             &profile_path,
             r#"{
                 "meta": { "name": "ssh-only" },
-                "network": { "allow_ssh": ["build.example.com"] }
+                "network": {
+                    "allow_domain": ["api.example.com"],
+                    "allow_ssh": ["build.example.com"]
+                }
             }"#,
         )
         .expect("write profile");
@@ -701,9 +704,13 @@ mod tests {
 
         let config =
             crate::proxy_runtime::build_proxy_config_from_flags(&opts).expect("build proxy config");
-        assert_eq!(
-            config.allowed_hosts,
-            vec!["build.example.com:22", "other.example.com:2222"]
+        assert!(
+            config.allowed_hosts.contains(&"build.example.com:22".to_string())
+                && config
+                    .allowed_hosts
+                    .contains(&"other.example.com:2222".to_string()),
+            "both SSH endpoints must reach the standalone proxy allowlist, got {:?}",
+            config.allowed_hosts
         );
     }
 

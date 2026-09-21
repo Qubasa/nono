@@ -101,14 +101,20 @@ fn python3_bin() -> Option<String> {
     None
 }
 
+/// The allowlist has to be doing the deciding for port-exactness to mean
+/// anything, so every case here pairs the SSH allowance with an `allow_domain`
+/// entry. On an open policy `allow_ssh` only adds the mediated route.
+fn filtered_profile(port: u16) -> String {
+    profile_json(&format!(
+        r#"{{"allow_domain":["example.invalid"],"allow_ssh":["127.0.0.1:{port}"]}}"#
+    ))
+}
+
 #[test]
 fn ssh_allowance_reaches_the_allowed_endpoint_through_the_mediated_route() {
     let server = BannerServer::start();
     let t = nono_test!("ssh-egress-allow");
-    let profile = t.write_profile(
-        "ssh-allow",
-        &profile_json(&format!(r#"{{"allow_ssh":["127.0.0.1:{}"]}}"#, server.port)),
-    );
+    let profile = t.write_profile("ssh-allow", &filtered_profile(server.port));
 
     t.run()
         .profile(&profile)
@@ -127,10 +133,7 @@ fn ssh_allowance_refuses_another_port_on_the_same_host() {
     let server = BannerServer::start();
     let other = BannerServer::start();
     let t = nono_test!("ssh-egress-port");
-    let profile = t.write_profile(
-        "ssh-port",
-        &profile_json(&format!(r#"{{"allow_ssh":["127.0.0.1:{}"]}}"#, server.port)),
-    );
+    let profile = t.write_profile("ssh-port", &filtered_profile(server.port));
 
     t.run()
         .profile(&profile)
@@ -156,10 +159,7 @@ fn direct_socket_to_the_allowed_endpoint_is_denied_even_without_proxy_env() {
     };
     let server = BannerServer::start();
     let t = nono_test!("ssh-egress-direct");
-    let profile = t.write_profile(
-        "ssh-direct",
-        &profile_json(&format!(r#"{{"allow_ssh":["127.0.0.1:{}"]}}"#, server.port)),
-    );
+    let profile = t.write_profile("ssh-direct", &filtered_profile(server.port));
 
     let script = format!(
         "import os, socket\n\

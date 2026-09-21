@@ -735,12 +735,6 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         ));
     }
 
-    eprintln!(
-        "DBG ssh_client={:?} bin_dir={:?} ts={:?}",
-        ssh_client.is_some(),
-        ssh_client.as_ref().and_then(|f| f.bin_dir()),
-        tool_sandbox_runtime.is_some()
-    );
     let config = exec_strategy::ExecConfig {
         command: &command,
         resolved_program: &exec_resolved_program,

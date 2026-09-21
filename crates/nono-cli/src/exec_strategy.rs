@@ -697,7 +697,6 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     // PATH back out of `env_c` so profile env filtering still decides the rest
     // of it. Never set under Tool Sandbox, whose shim dir owns `ssh`.
     if let Some(ssh_dir) = config.ssh_path_dir {
-        eprintln!("DBG prepending ssh dir {}", ssh_dir.display());
         let current_path = env_c
             .iter()
             .find_map(|entry| {
