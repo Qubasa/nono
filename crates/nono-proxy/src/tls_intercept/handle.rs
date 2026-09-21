@@ -1278,7 +1278,7 @@ where
         request.push_str(&format!("{}: {}\r\n", name, resolved_value));
     }
     request.push_str("Connection: close\r\n");
-    if !body.is_empty() {
+    if reverse::should_reframe_with_content_length(&req.header_bytes) {
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     request.push_str("\r\n");
@@ -1535,7 +1535,7 @@ where
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
     request.push_str("Connection: close\r\n");
-    if !body.is_empty() {
+    if reverse::should_reframe_with_content_length(&req.header_bytes) {
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     request.push_str("\r\n");
@@ -1775,7 +1775,7 @@ where
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
     request.push_str("Connection: close\r\n");
-    if !body.is_empty() {
+    if reverse::should_reframe_with_content_length(&req.header_bytes) {
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     request.push_str("\r\n");
