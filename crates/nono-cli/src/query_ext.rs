@@ -220,16 +220,90 @@ fn check_domain_deny(
     domain: &str,
     port: u16,
 ) -> Option<nono::net_filter::FilterResult> {
-    let normalized_domain = nono::net_filter::HostFilter::normalize_authority_host(domain);
-    // Bracket IPv6 literals so their colons aren't mistaken for the port separator.
-    let host_port = if normalized_domain.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{normalized_domain}]:{port}")
-    } else {
-        format!("{normalized_domain}:{port}")
-    };
     filter
-        .check_deny(&host_port)
+        .check_deny(&host_authority(domain, port))
         .or_else(|| filter.check_deny(domain))
+}
+
+/// Check the allowlist for the bare host, then for the `host:port` authority,
+/// so a port-exact entry from `allow_ssh` matches. Mirrors
+/// `ProxyFilter::check_host_result` (`nono-proxy/src/filter.rs`) minus DNS.
+fn check_domain_allow(
+    filter: &nono::net_filter::HostFilter,
+    domain: &str,
+    port: u16,
+) -> nono::net_filter::FilterResult {
+    let result = filter.check_host(domain, &[]);
+    if !matches!(result, nono::net_filter::FilterResult::DenyNotAllowed { .. }) {
+        return result;
+    }
+    filter.check_host(&host_authority(domain, port), &[])
+}
+
+/// `host:port`, with IPv6 literals bracketed so their colons aren't mistaken
+/// for the port separator.
+fn host_authority(domain: &str, port: u16) -> String {
+    let normalized = nono::net_filter::HostFilter::normalize_authority_host(domain);
+    if normalized.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{normalized}]:{port}")
+    } else {
+        format!("{normalized}:{port}")
+    }
+}
+
+/// Ports at which a port-exact allowlist entry names this host. Used to tell
+/// "host is not allowed" apart from "host is allowed, but not on this port".
+fn allowed_ports_for_host(allowed_domains: &[String], domain: &str) -> Vec<u16> {
+    let normalized = nono::net_filter::HostFilter::normalize_authority_host(domain);
+    let mut ports = Vec::new();
+    for entry in allowed_domains {
+        let (host, port) = match entry.strip_prefix('[') {
+            Some(rest) => match rest.split_once("]:") {
+                Some((host, port)) => (host, port),
+                None => continue,
+            },
+            None => match entry.rsplit_once(':') {
+                Some((host, port)) => (host, port),
+                None => continue,
+            },
+        };
+        let Ok(port) = port.parse::<u16>() else {
+            continue;
+        };
+        if host.eq_ignore_ascii_case(&normalized) && !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+    ports
+}
+
+/// A `Denied` result that names the ports this host *is* allowed on, so a
+/// port-exact allowance reads as "wrong port" rather than "unknown host".
+fn port_mismatch_result(
+    allowed_domains: &[String],
+    domain: &str,
+    port: u16,
+) -> Option<QueryResult> {
+    let ports = allowed_ports_for_host(allowed_domains, domain);
+    if ports.is_empty() {
+        return None;
+    }
+    let allowed = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(QueryResult::Denied {
+        reason: "port_not_allowed".to_string(),
+        details: Some(format!(
+            "{domain} is allowed on port {allowed}, not {port}. \
+             Port-exact allowances (network.allow_ssh) do not widen to other ports."
+        )),
+        policy_source: Some("proxy domain filter (port-exact entry)".to_string()),
+        matching_capability: None,
+        suggested_flag: Some(format!("--allow-ssh {domain}:{port}")),
+        endpoint_rules: None,
+    })
 }
 
 /// Query whether network access is permitted.
@@ -268,7 +342,7 @@ pub fn query_network(
             .with_denied_hosts(denied_domains);
             // Pass empty IPs: DNS resolution happens at proxy time, not query time.
             let check_result = check_domain_deny(&filter, &domain, port)
-                .unwrap_or_else(|| filter.check_host(&domain, &[]));
+                .unwrap_or_else(|| check_domain_allow(&filter, &domain, port));
             match check_result {
                 nono::net_filter::FilterResult::Allow => {
                     let matching_endpoints = domain_endpoints
@@ -357,14 +431,16 @@ pub fn query_network(
                         endpoint_rules: None,
                     }
                 }
-                deny => QueryResult::Denied {
-                    reason: "proxy_filtered".to_string(),
-                    details: Some(format!("Domain filtering is active. {}", deny.reason())),
-                    policy_source: Some("proxy domain filter".to_string()),
-                    matching_capability: None,
-                    suggested_flag: Some(format!("--allow-domain {}", domain)),
-                    endpoint_rules: None,
-                },
+                deny => port_mismatch_result(allowed_domains, &domain, port).unwrap_or_else(|| {
+                    QueryResult::Denied {
+                        reason: "proxy_filtered".to_string(),
+                        details: Some(format!("Domain filtering is active. {}", deny.reason())),
+                        policy_source: Some("proxy domain filter".to_string()),
+                        matching_capability: None,
+                        suggested_flag: Some(format!("--allow-domain {}", domain)),
+                        endpoint_rules: None,
+                    }
+                }),
             }
         }
         nono::NetworkMode::AllowAll => {
@@ -378,7 +454,7 @@ pub fn query_network(
                 }
                 .with_denied_hosts(denied_domains);
                 let check_result = check_domain_deny(&filter, &domain, port)
-                    .unwrap_or_else(|| filter.check_host(&domain, &[]));
+                    .unwrap_or_else(|| check_domain_allow(&filter, &domain, port));
                 match check_result {
                     nono::net_filter::FilterResult::Allow => {
                         let matching_endpoints = domain_endpoints
@@ -455,14 +531,21 @@ pub fn query_network(
                         suggested_flag: None,
                         endpoint_rules: None,
                     },
-                    deny => QueryResult::Denied {
-                        reason: "proxy_filtered".to_string(),
-                        details: Some(format!("Domain filtering is active. {}", deny.reason())),
-                        policy_source: Some("proxy domain filter".to_string()),
-                        matching_capability: None,
-                        suggested_flag: Some(format!("--allow-domain {}", domain)),
-                        endpoint_rules: None,
-                    },
+                    deny => {
+                        port_mismatch_result(allowed_domains, &domain, port).unwrap_or_else(|| {
+                            QueryResult::Denied {
+                                reason: "proxy_filtered".to_string(),
+                                details: Some(format!(
+                                    "Domain filtering is active. {}",
+                                    deny.reason()
+                                )),
+                                policy_source: Some("proxy domain filter".to_string()),
+                                matching_capability: None,
+                                suggested_flag: Some(format!("--allow-domain {}", domain)),
+                                endpoint_rules: None,
+                            }
+                        })
+                    }
                 }
             } else {
                 QueryResult::Allowed {

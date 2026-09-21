@@ -74,6 +74,7 @@ fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_>
         denied_env_vars: None,
         case_insensitive_env_vars: false,
         set_vars: vec![],
+        ssh_path_dir: None,
         tool_sandbox_runtime: None,
     }
 }

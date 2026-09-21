@@ -37,6 +37,9 @@ pub(crate) struct ActiveProxyRuntime {
     pub(crate) tool_sandbox_credential_env_vars: BTreeMap<String, Vec<(String, String)>>,
     pub(crate) tool_sandbox_trust_bundle_paths: Vec<std::path::PathBuf>,
     pub(crate) handle: Option<nono_proxy::server::ProxyHandle>,
+    /// Generated SSH config and `ssh` wrapper, alive for the session and
+    /// removed on drop. `None` unless `allow_ssh` is in effect.
+    pub(crate) ssh_client: Option<crate::ssh_client::SshClientFiles>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,6 +48,7 @@ pub(crate) struct EffectiveProxySettings {
     pub(crate) allow_domain: Vec<crate::profile::AllowDomainEntry>,
     pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
+    pub(crate) allow_ssh: Vec<String>,
     pub(crate) no_proxy: Vec<String>,
 }
 
@@ -1428,6 +1432,7 @@ pub(crate) fn prepare_proxy_launch_options(
     let network_profile = effective_proxy.network_profile;
     let allow_domain = effective_proxy.allow_domain;
     let deny_domain = effective_proxy.deny_domain;
+    let allow_ssh = effective_proxy.allow_ssh;
     let mut credentials = effective_proxy.credentials;
     let no_proxy = effective_proxy.no_proxy;
     let mut custom_credentials = prepared.custom_credentials.clone();
@@ -1472,8 +1477,10 @@ pub(crate) fn prepare_proxy_launch_options(
         bypass
     };
 
-    let has_domain_filter =
-        network_profile.is_some() || !allow_domain.is_empty() || !deny_domain.is_empty();
+    let has_domain_filter = network_profile.is_some()
+        || !allow_domain.is_empty()
+        || !deny_domain.is_empty()
+        || !allow_ssh.is_empty();
     let has_credentials = !credentials.is_empty();
     let would_activate = has_domain_filter || has_credentials || upstream_proxy_addr.is_some();
 
@@ -1502,16 +1509,20 @@ pub(crate) fn prepare_proxy_launch_options(
         .into_iter()
         .partition(|e| !matches!(e, crate::profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
 
-    let domain_filter =
-        if network_profile.is_some() || !plain_entries.is_empty() || !deny_domain.is_empty() {
-            Some(DomainFilterIntent {
-                network_profile,
-                allow_domain: plain_entries,
-                deny_domain,
-            })
-        } else {
-            None
-        };
+    let domain_filter = if network_profile.is_some()
+        || !plain_entries.is_empty()
+        || !deny_domain.is_empty()
+        || !allow_ssh.is_empty()
+    {
+        Some(DomainFilterIntent {
+            network_profile,
+            allow_domain: plain_entries,
+            deny_domain,
+            allow_ssh,
+        })
+    } else {
+        None
+    };
 
     let endpoint_filter = if !endpoint_entries.is_empty() {
         debug_assert!(
@@ -1714,6 +1725,7 @@ pub(crate) fn resolve_effective_proxy_settings(
             allow_domain: Vec::new(),
             deny_domain: Vec::new(),
             credentials: Vec::new(),
+            allow_ssh: Vec::new(),
             no_proxy: Vec::new(),
         });
     }
@@ -1728,17 +1740,21 @@ pub(crate) fn resolve_effective_proxy_settings(
     deny_domain.extend(args.deny_proxy.iter().cloned());
     let mut credentials = prepared.credentials.clone();
     credentials.extend(args.proxy_credential.clone());
+    let mut allow_ssh = prepared.allow_ssh.clone();
+    allow_ssh.extend(args.allow_ssh.iter().cloned());
 
     let effective = EffectiveProxySettings {
         network_profile,
         allow_domain,
         deny_domain,
         credentials,
+        allow_ssh,
         no_proxy: prepared.no_proxy.clone(),
     };
     crate::profile::validate_no_proxy_allow_domain_conflicts(
         &effective.no_proxy,
         &effective.allow_domain,
+        &effective.allow_ssh,
     )?;
     Ok(effective)
 }
@@ -2396,6 +2412,17 @@ pub(crate) fn build_proxy_config_from_flags(
         .unwrap_or(&[]);
     let (mut plain_hosts, _) =
         network_policy::partition_allow_domain(&net_policy, plain_allow_domain)?;
+    // Port-exact, and therefore appended *after* partitioning: going through
+    // `expand_proxy_allow` would strip the ":port" that makes the allowance
+    // name one service rather than a whole host. No bare-host fallback for
+    // the same reason.
+    let ssh_hosts = proxy
+        .domain_filter
+        .as_ref()
+        .map(|d| network_policy::ssh_allowlist_entries(&d.allow_ssh))
+        .transpose()?
+        .unwrap_or_default();
+    plain_hosts.extend(ssh_hosts.iter().cloned());
 
     let endpoint_allow_domain = proxy
         .endpoint_filter
@@ -2688,13 +2715,19 @@ fn origin_host_port(origin: &str) -> Result<Option<String>> {
 #[must_use = "proxy launch no_proxy conflict validation result must be handled"]
 fn validate_proxy_launch_no_proxy_conflicts(proxy: &ProxyLaunchOptions) -> Result<()> {
     let mut allow_domain = Vec::new();
+    let mut allow_ssh = Vec::new();
     if let Some(domain_filter) = proxy.domain_filter.as_ref() {
         allow_domain.extend(domain_filter.allow_domain.iter().cloned());
+        allow_ssh.extend(domain_filter.allow_ssh.iter().cloned());
     }
     if let Some(endpoint_filter) = proxy.endpoint_filter.as_ref() {
         allow_domain.extend(endpoint_filter.routes.iter().cloned());
     }
-    crate::profile::validate_no_proxy_allow_domain_conflicts(&proxy.no_proxy, &allow_domain)
+    crate::profile::validate_no_proxy_allow_domain_conflicts(
+        &proxy.no_proxy,
+        &allow_domain,
+        &allow_ssh,
+    )
 }
 
 fn expanded_proxy_host_patterns(
@@ -2955,6 +2988,7 @@ pub(crate) fn start_proxy_runtime(
             tool_sandbox_credential_env_vars: BTreeMap::new(),
             tool_sandbox_trust_bundle_paths: Vec::new(),
             handle: None,
+            ssh_client: None,
         });
     };
     if !proxy.is_active() {
@@ -2963,6 +2997,7 @@ pub(crate) fn start_proxy_runtime(
             tool_sandbox_credential_env_vars: BTreeMap::new(),
             tool_sandbox_trust_bundle_paths: Vec::new(),
             handle: None,
+            ssh_client: None,
         });
     }
 
@@ -3121,6 +3156,27 @@ pub(crate) fn start_proxy_runtime(
     }
     extend_provider_base_url_env_vars(proxy, port, &mut env_vars);
 
+    // `allow_ssh` in effect: give `ssh` and `git` a config that routes through
+    // the CONNECT tunnel. Same lifecycle as the TLS-intercept bundle — a
+    // session-scoped 0o700 dir, granted read, removed on drop.
+    let ssh_client = if proxy
+        .domain_filter
+        .as_ref()
+        .is_some_and(|filter| !filter.allow_ssh.is_empty())
+    {
+        let nono_exe = std::env::current_exe().map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "network.allow_ssh needs the path to the running nono binary: {e}"
+            ))
+        })?;
+        let files = crate::ssh_client::prepare_ssh_client_files(&nono_exe)?;
+        grant_ssh_client_access(caps, &files)?;
+        env_vars.push(("GIT_SSH_COMMAND".to_string(), files.git_ssh_command()));
+        Some(files)
+    } else {
+        None
+    };
+
     std::mem::forget(rt);
 
     Ok(ActiveProxyRuntime {
@@ -3128,7 +3184,44 @@ pub(crate) fn start_proxy_runtime(
         tool_sandbox_credential_env_vars,
         tool_sandbox_trust_bundle_paths,
         handle: Some(handle),
+        ssh_client,
     })
+}
+
+/// Grant the sandboxed child read (and, on Linux, execute) access to the
+/// generated SSH config and wrapper. Mirrors the TLS-intercept bundle grant:
+/// both live under the protected `~/.nono` root, which on macOS needs
+/// action-matching platform rules to override the `file-read-data` deny.
+fn grant_ssh_client_access(
+    caps: &mut CapabilitySet,
+    files: &crate::ssh_client::SshClientFiles,
+) -> Result<()> {
+    let mut paths = vec![files.config_path()];
+    paths.extend(files.wrapper_path());
+    for path in paths {
+        #[cfg(target_os = "macos")]
+        {
+            let path_str = crate::policy::path_to_utf8(path)?;
+            let escaped = crate::policy::escape_seatbelt_path(path_str)?;
+            caps.add_platform_rule(format!("(allow file-read-data (literal \"{escaped}\"))"))?;
+            caps.add_platform_rule(format!("(allow file-read-metadata (literal \"{escaped}\"))"))?;
+            caps.add_platform_rule(format!("(allow process-exec (literal \"{escaped}\"))"))?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            caps.allow_file_mut(path, AccessMode::Read).map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Failed to grant read capability on generated SSH file '{}': {e}",
+                    path.display()
+                ))
+            })?;
+        }
+        debug!(
+            "Granted sandboxed child read access to generated SSH file: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn extend_provider_base_url_env_vars(
@@ -3472,6 +3565,7 @@ mod tests {
                 network_profile: None,
                 allow_domain,
                 deny_domain: Vec::new(),
+                allow_ssh: Vec::new(),
             }),
             credentials: Some(CredentialProxyIntent {
                 credentials: vec!["bedrock".to_string()],
@@ -3554,6 +3648,93 @@ mod tests {
         Ok(())
     }
 
+    fn ssh_only_proxy(allow_ssh: &[&str]) -> ProxyLaunchOptions {
+        ProxyLaunchOptions {
+            domain_filter: Some(DomainFilterIntent {
+                network_profile: None,
+                allow_domain: Vec::new(),
+                deny_domain: Vec::new(),
+                allow_ssh: allow_ssh.iter().map(|s| (*s).to_string()).collect(),
+            }),
+            ..ProxyLaunchOptions::default()
+        }
+    }
+
+    #[test]
+    fn test_allow_ssh_is_port_exact_in_the_allowlist() -> Result<()> {
+        let config = build_proxy_config_from_flags(&ssh_only_proxy(&["deploy@build.example.com"]))?;
+
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "build.example.com:22"),
+            "allow_ssh must reach the allowlist as host:port, got {:?}",
+            config.allowed_hosts
+        );
+        assert!(
+            !config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "build.example.com"),
+            "a bare-host fallback would defeat port-exactness, got {:?}",
+            config.allowed_hosts
+        );
+        Ok(())
+    }
+
+    /// #1485: an empty allowlist means allow-all downstream, so an SSH-only
+    /// run must not leave the list empty.
+    #[test]
+    fn test_allow_ssh_only_run_keeps_the_host_allowlist_active() -> Result<()> {
+        let config = build_proxy_config_from_flags(&ssh_only_proxy(&["build.example.com:2222"]))?;
+        assert_eq!(config.allowed_hosts, vec!["build.example.com:2222"]);
+        Ok(())
+    }
+
+    /// The contract that distinguishes `allow_ssh` from `allow_domain`: the
+    /// allowed port is reachable and every other port on the same host is not.
+    #[test]
+    fn test_allow_ssh_allowlist_refuses_other_ports_and_hosts() -> Result<()> {
+        let config = build_proxy_config_from_flags(&ssh_only_proxy(&["localhost:2222"]))?;
+        let filter = nono_proxy::filter::ProxyFilter::new(&config.allowed_hosts);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| NonoError::ConfigParse(format!("runtime: {e}")))?;
+
+        let allowed = |host: &str, port: u16| {
+            rt.block_on(filter.check_host(host, port))
+                .expect("filter check")
+                .result
+                .is_allowed()
+        };
+
+        assert!(
+            allowed("localhost", 2222),
+            "the allowed endpoint must pass the filter"
+        );
+        assert!(
+            !allowed("localhost", 22),
+            "another port on the allowed host must be refused"
+        );
+        assert!(
+            !allowed("example.com", 2222),
+            "another host on the allowed port must be refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_allow_ssh_rejects_wildcard_endpoints() {
+        let err = build_proxy_config_from_flags(&ssh_only_proxy(&["*.example.com"]))
+            .expect_err("a wildcard SSH endpoint must not build a proxy config");
+        assert!(
+            err.to_string().contains("*.example.com"),
+            "the error must name the offending entry, got: {err}"
+        );
+    }
+
     #[test]
     fn test_build_proxy_config_rejects_group_expanded_no_proxy_overlap() {
         let proxy = ProxyLaunchOptions {
@@ -3563,6 +3744,7 @@ mod tests {
                     "github".to_string(),
                 )],
                 deny_domain: Vec::new(),
+                allow_ssh: Vec::new(),
             }),
             no_proxy: vec![".github.com".to_string()],
             ..ProxyLaunchOptions::default()
@@ -3673,6 +3855,7 @@ mod tests {
             rollback_exclude_globs: Vec::new(),
             network_profile: None,
             allow_domain: Vec::new(),
+            allow_ssh: Vec::new(),
             deny_domain: Vec::new(),
             credentials: Vec::new(),
             custom_credentials,
@@ -3747,6 +3930,7 @@ mod tests {
             rollback_exclude_globs: Vec::new(),
             network_profile: None,
             allow_domain: Vec::new(),
+            allow_ssh: Vec::new(),
             deny_domain: Vec::new(),
             credentials: Vec::new(),
             custom_credentials: HashMap::new(),
@@ -3816,6 +4000,7 @@ mod tests {
             rollback_exclude_globs: Vec::new(),
             network_profile: None,
             allow_domain: Vec::new(),
+            allow_ssh: Vec::new(),
             deny_domain: Vec::new(),
             credentials: Vec::new(),
             custom_credentials: HashMap::new(),

@@ -85,6 +85,10 @@ pub(crate) struct DomainFilterIntent {
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
     /// Domains to deny regardless of the allowlist.
     pub(crate) deny_domain: Vec<String>,
+    /// Port-exact `host:port` SSH endpoints. Deliberately not
+    /// `AllowDomainEntry`: these must reach the proxy allowlist without
+    /// passing through `expand_proxy_allow`, which strips the port.
+    pub(crate) allow_ssh: Vec<String>,
 }
 
 /// `WithEndpoints` allow-domain entries that require TLS interception so the

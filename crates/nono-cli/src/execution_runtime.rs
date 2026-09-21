@@ -318,6 +318,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } else {
         plain_domain_strs
     };
+    // Port-exact SSH endpoints join the state allowlist verbatim, so
+    // `nono why --self` sees the same `host:port` entries the proxy enforces.
+    let allowed_domain_strs: Vec<String> = {
+        let mut domains = allowed_domain_strs;
+        let ssh_entries = domain_filter.map(|d| d.allow_ssh.as_slice()).unwrap_or(&[]);
+        match network_policy::ssh_allowlist_entries(ssh_entries) {
+            Ok(entries) => domains.extend(entries),
+            Err(e) => warn!("failed to resolve allow_ssh entries for sandbox state: {e}"),
+        }
+        domains
+    };
     // Expand `deny_domain` the same way for `nono why --self`.
     let denied_domain_strs: Vec<String> = domain_filter
         .map(|d| d.deny_domain.as_slice())
@@ -400,6 +411,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let tool_sandbox_proxy_credential_env_vars = active_proxy.tool_sandbox_credential_env_vars;
     let tool_sandbox_trust_bundle_paths = active_proxy.tool_sandbox_trust_bundle_paths;
     let proxy_handle = active_proxy.handle;
+    let ssh_client = active_proxy.ssh_client;
 
     let requested_workdir =
         flags
@@ -667,6 +679,42 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         }
     };
 
+    // `allow_ssh` promises "only this endpoint"; the seccomp-notify destination
+    // pin is what makes that true. Key the refusal off whether the pin will
+    // actually be installed, not off the policy names that skip it, so a new
+    // opt-out cannot reopen this hole silently.
+    #[cfg(target_os = "linux")]
+    if !seccomp_proxy_fallback
+        && flags
+            .network
+            .proxy_options()
+            .and_then(|opts| opts.domain_filter.as_ref())
+            .is_some_and(|filter| !filter.allow_ssh.is_empty())
+    {
+        let cause = match flags.sandbox_policy {
+            crate::profile::LinuxSandboxPolicy::Landlock => {
+                "linux.sandbox_policy = \"landlock\" opts out of the seccomp \
+                 user-notification supervisor"
+            }
+            crate::profile::LinuxSandboxPolicy::External => {
+                "linux.sandbox_policy = \"external\" opts out of the seccomp \
+                 user-notification supervisor"
+            }
+            crate::profile::LinuxSandboxPolicy::Auto => {
+                "this kernel runs the sandbox without the seccomp user-notification \
+                 supervisor (WSL2 returns EBUSY for seccomp notify listeners)"
+            }
+        };
+        return Err(NonoError::SandboxInit(format!(
+            "network.allow_ssh cannot be kernel-enforced here: {cause}.\n\n\
+             That supervisor is what pins outbound connections to the proxy; Landlock \
+             filters by port only, never by destination address. The sandboxed process \
+             would be able to open arbitrary outbound connections instead of only the \
+             allowed SSH endpoint.\n\n\
+             Remove the allow_ssh entries, or run where the supervisor is available."
+        )));
+    }
+
     #[cfg(target_os = "linux")]
     if flags.af_unix_mediation.is_pathname() && nono::sandbox::is_wsl2() {
         return Err(NonoError::SandboxInit(
@@ -737,6 +785,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         denied_env_vars: flags.denied_env_vars,
         case_insensitive_env_vars: flags.case_insensitive_env_vars,
         set_vars: flags.set_vars.unwrap_or_default(),
+        // Under Tool Sandbox the shim dir owns `ssh` on PATH, and the outer exec
+        // gate only permits the shims; a wrapper here would shadow the shim and
+        // then be refused. GIT_SSH_COMMAND still routes through the shim.
+        ssh_path_dir: ssh_client
+            .as_ref()
+            .filter(|_| tool_sandbox_runtime.is_none())
+            .and_then(|files| files.bin_dir()),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         tool_sandbox_runtime: tool_sandbox_runtime.as_ref(),
     };
@@ -806,11 +861,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             drop(config);
             drop(loaded_secrets);
             // `std::process::exit` does NOT run destructors, so we must drop
-            // the proxy handle explicitly to fire its `Drop` impl — that's
-            // what removes the TLS-intercept trust bundle and its parent
-            // session directory under `~/.nono/sessions/`. Without this
-            // every supervised-mode session leaks a file + directory.
+            // the proxy handle and the generated SSH files explicitly to fire
+            // their `Drop` impls — that's what removes the TLS-intercept trust
+            // bundle, the generated ssh config, and their parent session
+            // directories under `~/.nono/sessions/`. Without this every
+            // supervised-mode session leaks files + directories.
             drop(proxy_handle);
+            drop(ssh_client);
             crate::tool_sandbox::log_main_total();
             std::process::exit(exit_code);
         }

@@ -668,6 +668,23 @@ IN-BAND DETACH:
     /// Internal: refresh cached pack update hints out of process
     #[command(hide = true)]
     PackUpdateHintHelper(PackUpdateHintHelperArgs),
+
+    /// Internal: HTTP CONNECT client used as an OpenSSH ProxyCommand
+    #[command(hide = true)]
+    SshTunnel(SshTunnelArgs),
+}
+
+/// Arguments for the hidden `nono ssh-tunnel` helper.
+///
+/// OpenSSH substitutes `%h` and `%p` into the configured `ProxyCommand`, so
+/// the host and port arrive as plain positionals.
+#[derive(Parser, Debug)]
+pub struct SshTunnelArgs {
+    /// Target host (OpenSSH `%h`)
+    pub host: String,
+
+    /// Target port (OpenSSH `%p`)
+    pub port: u16,
 }
 
 #[derive(Parser, Debug)]
@@ -1153,6 +1170,7 @@ pub struct SandboxArgs {
             "block_net",
             "network_profile",
             "allow_proxy",
+            "allow_ssh",
             "proxy_credential",
             "external_proxy",
             "external_proxy_bypass",
@@ -1182,6 +1200,17 @@ pub struct SandboxArgs {
         help_heading = "NETWORK"
     )]
     pub allow_proxy: Vec<String>,
+
+    /// Allow SSH to one endpoint, as [user@]host[:port] (repeatable).
+    /// Port-exact: it defaults to 22 and no other port on that host is opened.
+    /// Wildcards are rejected. Activates proxy mode on its own.
+    #[arg(
+        long = "allow-ssh",
+        env = "NONO_ALLOW_SSH",
+        value_name = "SSH_TARGET",
+        help_heading = "NETWORK"
+    )]
+    pub allow_ssh: Vec<String>,
 
     /// Block a domain through the proxy. Evaluated before the allowlist.
     /// Supports wildcards (e.g. *.ads.example.com). Incompatible with --allow-net.
@@ -1382,7 +1411,7 @@ pub struct SandboxArgs {
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
             "allow_unix_socket_subtree", "allow_unix_socket_subtree_bind",
             "profile", "extends", "bypass_protection", "suppress_save_prompt", "allow_cwd",
-            "block_net", "allow_net", "network_profile", "allow_proxy",
+            "block_net", "allow_net", "network_profile", "allow_proxy", "allow_ssh",
             "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu", "allow_http2",
@@ -1417,6 +1446,7 @@ impl SandboxArgs {
     pub fn has_proxy_flags(&self) -> bool {
         self.network_profile.is_some()
             || !self.allow_proxy.is_empty()
+            || !self.allow_ssh.is_empty()
             || !self.proxy_credential.is_empty()
             || self.external_proxy.is_some()
     }
@@ -1511,6 +1541,16 @@ pub struct ProxyArgs {
         help_heading = "NETWORK"
     )]
     pub allow_proxy: Vec<String>,
+
+    /// Allow SSH to one endpoint, as [user@]host[:port] (repeatable).
+    /// Port-exact: it defaults to 22 and no other port on that host is opened.
+    #[arg(
+        long = "allow-ssh",
+        env = "NONO_ALLOW_SSH",
+        value_name = "SSH_TARGET",
+        help_heading = "NETWORK"
+    )]
+    pub allow_ssh: Vec<String>,
 
     /// Block a domain through the proxy. Evaluated before the allowlist.
     /// Supports wildcards (e.g. *.ads.example.com).
@@ -1859,6 +1899,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_net: false,
             network_profile: None,
             allow_proxy: Vec::new(),
+            allow_ssh: Vec::new(),
             deny_proxy: Vec::new(),
             allow_bind: args.allow_bind,
             allow_port: args.allow_port,
@@ -2159,6 +2200,10 @@ pub struct WhyArgs {
         help_heading = "QUERY"
     )]
     pub allow_proxy: Vec<String>,
+
+    /// Add an SSH endpoint to the allowlist for this query (repeatable)
+    #[arg(long = "allow-ssh", value_name = "SSH_TARGET", help_heading = "QUERY")]
+    pub allow_ssh: Vec<String>,
 
     /// Block a domain through the proxy for this query (repeatable)
     #[arg(long = "deny-domain", value_name = "DOMAIN", help_heading = "QUERY")]

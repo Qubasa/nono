@@ -67,6 +67,7 @@ fn test_schema_network_config_matches_rust_model() {
             "allow_http2",
             "network_profile",
             "allow_domain",
+            "allow_ssh",
             "deny_domain",
             "credentials",
             "open_port",

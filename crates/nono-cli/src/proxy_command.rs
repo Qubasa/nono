@@ -205,6 +205,9 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
             .map(|s| crate::proxy_runtime::parse_allow_domain_arg(s)),
     );
 
+    let mut allow_ssh: Vec<String> = network.map(|n| n.allow_ssh.clone()).unwrap_or_default();
+    allow_ssh.extend(args.allow_ssh.iter().cloned());
+
     let mut deny_domain: Vec<String> = network.map(|n| n.deny_domain.clone()).unwrap_or_default();
     deny_domain.extend(args.deny_proxy.iter().cloned());
 
@@ -270,16 +273,20 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         .into_iter()
         .partition(|e| !matches!(e, profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
 
-    let domain_filter =
-        if network_profile.is_some() || !plain_entries.is_empty() || !deny_domain.is_empty() {
-            Some(DomainFilterIntent {
-                network_profile,
-                allow_domain: plain_entries,
-                deny_domain,
-            })
-        } else {
-            None
-        };
+    let domain_filter = if network_profile.is_some()
+        || !plain_entries.is_empty()
+        || !deny_domain.is_empty()
+        || !allow_ssh.is_empty()
+    {
+        Some(DomainFilterIntent {
+            network_profile,
+            allow_domain: plain_entries,
+            deny_domain,
+            allow_ssh,
+        })
+    } else {
+        None
+    };
 
     let endpoint_filter = if endpoint_entries.is_empty() {
         None
@@ -657,6 +664,47 @@ mod tests {
             .map(crate::profile::AllowDomainEntry::domain)
             .collect();
         assert_eq!(domains, vec!["solo.example.com"]);
+    }
+
+    /// The standalone proxy is a second copy of the profile -> proxy merge; an
+    /// `allow_ssh` it silently dropped would be a trap.
+    #[test]
+    fn allow_ssh_reaches_the_standalone_proxy_allowlist() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("ssh.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "ssh-only" },
+                "network": { "allow_ssh": ["build.example.com"] }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&[
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--allow-ssh",
+            "deploy@other.example.com:2222",
+        ]);
+        let opts = build_launch_options(&args).expect("allow_ssh is a valid proxy configuration");
+        let filter = opts
+            .domain_filter
+            .as_ref()
+            .expect("allow_ssh alone must produce a domain filter");
+        assert_eq!(
+            filter.allow_ssh,
+            vec!["build.example.com", "deploy@other.example.com:2222"]
+        );
+
+        let config =
+            crate::proxy_runtime::build_proxy_config_from_flags(&opts).expect("build proxy config");
+        assert_eq!(
+            config.allowed_hosts,
+            vec!["build.example.com:22", "other.example.com:2222"]
+        );
     }
 
     #[test]

@@ -894,6 +894,11 @@
           },
           "description": "Additional domains to allow through the proxy. Entries can be plain hostname strings (CONNECT tunnel, no L7 filtering) or objects with endpoint rules (TLS-intercepted method+path filtering). When endpoints are present, only matching requests are allowed (default-deny)."
         },
+        "allow_ssh": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "SSH endpoints the sandbox may reach, as [user@]host[:port]. Port-exact: the port defaults to 22 and no other port on that host is opened, unlike allow_domain. Wildcards are rejected. Activates proxy mode on its own."
+        },
         "credentials": {
           "type": "array",
           "items": { "type": "string" },

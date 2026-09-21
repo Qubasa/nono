@@ -395,6 +395,25 @@ nono run --allow-cwd --network-profile minimal --allow-domain custom-api.example
 
 When a URL with a path is provided, only requests matching that path pattern are permitted. Requests to other paths on the same domain are denied with `403 Forbidden`. Pattern syntax: `*` matches one path segment, `**` matches zero or more.
 
+#### `--allow-ssh`
+
+Allow SSH to one endpoint through the proxy, written as `[user@]host[:port]`. Can be specified multiple times. Port-exact: the port defaults to 22 and no other port on that host is opened, unlike `--allow-domain`. Activates proxy mode if not already active.
+
+```bash
+# Allow git over SSH to one build host (port 22)
+nono run --allow-cwd --allow-ssh build.example.com -- git fetch
+
+# Non-default port; any user@ prefix is accepted and ignored. `ssh` has to be
+# resolved inside the sandbox to pick up the generated config, so go through a
+# shell: a top-level `-- ssh …` is resolved against the host PATH beforehand.
+nono run --allow-cwd --allow-ssh deploy@other.example.com:2222 \
+  -- sh -c 'ssh -p 2222 deploy@other.example.com'
+```
+
+Wildcards (`*.example.com`), an empty host, and a port outside 1–65535 are rejected. Incompatible with `--block-net` and `--allow-net`, both of which remove the proxy that pins the destination. Also accepted by `nono shell`, `nono proxy`, and `nono why`. See [SSH Egress Pinning](/cli/features/networking#ssh-egress-pinning).
+
+Environment variable: `NONO_ALLOW_SSH`
+
 #### `--deny-domain`
 
 Block a domain through the proxy even if it would otherwise be allowed. Can be specified multiple times. Activates proxy mode if not already active.
@@ -1591,6 +1610,7 @@ CLI flags always take precedence over environment variables.
 | `--profile` | `NONO_PROFILE` | `NONO_PROFILE=developer` |
 | `--network-profile` | `NONO_NETWORK_PROFILE` | `NONO_NETWORK_PROFILE=claude-code` |
 | `--allow-domain` | `NONO_ALLOW_DOMAIN` | `NONO_ALLOW_DOMAIN=api.openai.com` |
+| `--allow-ssh` | `NONO_ALLOW_SSH` | `NONO_ALLOW_SSH=build.example.com` |
 | `--credential` | `NONO_CREDENTIAL` | `NONO_CREDENTIAL=openai` |
 | `--env-credential` | `NONO_ENV_CREDENTIAL` | `NONO_ENV_CREDENTIAL=key1,key2` |
 | `--capability-elevation` | `NONO_CAPABILITY_ELEVATION` | `NONO_CAPABILITY_ELEVATION=true` |

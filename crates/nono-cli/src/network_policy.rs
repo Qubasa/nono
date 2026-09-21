@@ -404,6 +404,109 @@ pub fn expand_proxy_allow(policy: &NetworkPolicy, entries: &[String]) -> Vec<Str
     result
 }
 
+/// Default TCP port for an SSH allowance that omits one.
+pub const DEFAULT_SSH_PORT: u16 = 22;
+
+/// Parse an `allow_ssh` entry of the form `[user@]host[:port]`.
+///
+/// The port defaults to [`DEFAULT_SSH_PORT`] and any `user@` prefix is
+/// accepted and discarded, so an SSH target copied from a shell command
+/// parses verbatim. Unlike `allow_domain`, the host must be concrete:
+/// wildcards are rejected, because the whole point of the allowance is that
+/// it names one server.
+///
+/// # Errors
+///
+/// Returns [`NonoError::ConfigParse`] naming the offending entry when the
+/// host is empty or wildcarded, an IPv6 literal is unbracketed, or the port
+/// is not in 1-65535.
+pub fn parse_ssh_endpoint(entry: &str) -> Result<(String, u16)> {
+    let invalid = |reason: &str| {
+        NonoError::ConfigParse(format!("SSH endpoint '{entry}' is invalid: {reason}"))
+    };
+
+    let target = entry.rsplit_once('@').map_or(entry, |(_user, host)| host);
+    if target.contains('*') {
+        return Err(invalid(
+            "wildcards are not allowed — an SSH allowance must name a single host",
+        ));
+    }
+
+    let (host, port) = split_ssh_authority(target)
+        .ok_or_else(|| invalid("expected [user@]host[:port]; bracket IPv6 literals as [::1]:22"))?;
+
+    if host.is_empty() {
+        return Err(invalid("host is empty"));
+    }
+    if host
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '@' | '[' | ']'))
+    {
+        return Err(invalid("host contains a character that cannot appear in a hostname"));
+    }
+    nono::net_filter::validate_host_pattern(host).map_err(|err| invalid(&err))?;
+
+    let port = match port {
+        None => DEFAULT_SSH_PORT,
+        Some(raw) => match raw.parse::<u16>() {
+            Ok(0) | Err(_) => {
+                return Err(invalid("port must be a number in 1-65535"));
+            }
+            Ok(port) => port,
+        },
+    };
+
+    Ok((host.to_string(), port))
+}
+
+/// Split `host[:port]`, keeping bracketed IPv6 literals intact.
+fn split_ssh_authority(target: &str) -> Option<(&str, Option<&str>)> {
+    if let Some(rest) = target.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = match tail {
+            "" => None,
+            tail => Some(tail.strip_prefix(':')?),
+        };
+        return Some((host, port));
+    }
+    match target.split_once(':') {
+        // An unbracketed IPv6 literal has no unambiguous port separator.
+        Some((_, rest)) if rest.contains(':') => None,
+        Some((host, port)) => Some((host, Some(port))),
+        None => Some((target, None)),
+    }
+}
+
+/// Format an SSH endpoint the way [`nono_proxy::filter::ProxyFilter`] builds
+/// the `host:port` key it looks up, so a port-exact allowlist entry matches.
+///
+/// The host is normalized first. The filter normalizes a stored entry as a
+/// whole string, which would leave an FQDN's trailing dot sitting in front of
+/// the `:port` and make the entry match nothing at all.
+#[must_use]
+pub fn ssh_endpoint_authority(host: &str, port: u16) -> String {
+    let host = nono::net_filter::HostFilter::normalize_authority_host(host);
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Parse `allow_ssh` entries into port-exact proxy allowlist authorities.
+///
+/// # Errors
+///
+/// Propagates the first [`parse_ssh_endpoint`] failure.
+pub fn ssh_allowlist_entries(entries: &[String]) -> Result<Vec<String>> {
+    let mut result = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let (host, port) = parse_ssh_endpoint(entry)?;
+        result.push(ssh_endpoint_authority(&host, port));
+    }
+    Ok(result)
+}
+
 /// Check if a domain is a loopback address (localhost, 127.x.x.x, ::1).
 fn is_loopback_domain(domain: &str) -> bool {
     domain == "localhost"
@@ -518,6 +621,68 @@ mod tests {
         let policy = load_network_policy(json).unwrap();
         assert!(!policy.groups.is_empty());
         assert!(!policy.profiles.is_empty());
+    }
+
+    #[test]
+    fn parse_ssh_endpoint_accepts_pasted_ssh_targets() {
+        assert_eq!(
+            parse_ssh_endpoint("deploy@build.example.com:2222").unwrap(),
+            ("build.example.com".to_string(), 2222)
+        );
+        assert_eq!(
+            parse_ssh_endpoint("build.example.com").unwrap(),
+            ("build.example.com".to_string(), 22)
+        );
+        assert_eq!(
+            parse_ssh_endpoint("[::1]:22").unwrap(),
+            ("::1".to_string(), 22)
+        );
+        assert_eq!(parse_ssh_endpoint("[::1]").unwrap(), ("::1".to_string(), 22));
+    }
+
+    #[test]
+    fn parse_ssh_endpoint_rejects_unusable_entries() {
+        for entry in [
+            "*.example.com",
+            "",
+            "deploy@",
+            "build.example.com:0",
+            "build.example.com:65536",
+            "build.example.com:ssh",
+            "::1",
+        ] {
+            let err = parse_ssh_endpoint(entry)
+                .expect_err("entry must be rejected")
+                .to_string();
+            assert!(
+                err.contains(entry),
+                "error for '{entry}' must name the entry, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_allowlist_entries_are_port_exact_and_bracket_ipv6() {
+        let entries = ssh_allowlist_entries(&[
+            "build.example.com".to_string(),
+            "deploy@other.example.com:2222".to_string(),
+            "[::1]:22".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            entries,
+            vec!["build.example.com:22", "other.example.com:2222", "[::1]:22"]
+        );
+    }
+
+    /// The proxy normalizes an incoming authority host before appending the
+    /// port, so an entry that keeps an FQDN's trailing dot would be inert.
+    #[test]
+    fn ssh_allowlist_entries_normalize_the_host() {
+        let entries =
+            ssh_allowlist_entries(&["Build.Example.com.".to_string(), "h.:2222".to_string()])
+                .unwrap();
+        assert_eq!(entries, vec!["build.example.com:22", "h:2222"]);
     }
 
     #[test]

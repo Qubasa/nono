@@ -72,6 +72,8 @@ mod sandbox_state;
 mod session;
 mod session_commands;
 mod setup;
+mod ssh_client;
+mod ssh_tunnel;
 mod startup_prompt;
 mod startup_runtime;
 mod state_paths;
@@ -290,6 +292,7 @@ mod tests {
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
             )],
+            allow_ssh: vec!["build.example.com".to_string()],
             deny_domain: Vec::new(),
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
@@ -334,6 +337,7 @@ mod tests {
             EffectiveProxySettings {
                 network_profile: None,
                 allow_domain: Vec::new(),
+                allow_ssh: Vec::new(),
                 deny_domain: Vec::new(),
                 credentials: Vec::new(),
                 no_proxy: Vec::new(),
@@ -347,6 +351,7 @@ mod tests {
         let args = SandboxArgs {
             network_profile: Some("minimal".to_string()),
             allow_proxy: vec!["example.com".to_string()],
+            allow_ssh: vec!["deploy@other.example.com:2222".to_string()],
             proxy_credential: vec!["openai".to_string()],
             ..sandbox_args()
         };
@@ -366,6 +371,7 @@ mod tests {
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
             )],
+            allow_ssh: vec!["build.example.com".to_string()],
             deny_domain: Vec::new(),
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
@@ -412,6 +418,10 @@ mod tests {
                 allow_domain: vec![
                     profile::AllowDomainEntry::Plain("docs.python.org".to_string()),
                     profile::AllowDomainEntry::Plain("example.com".to_string()),
+                ],
+                allow_ssh: vec![
+                    "build.example.com".to_string(),
+                    "deploy@other.example.com:2222".to_string(),
                 ],
                 deny_domain: Vec::new(),
                 credentials: vec!["github".to_string(), "openai".to_string()],

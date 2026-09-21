@@ -285,6 +285,7 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
         let mut network = serde_json::Map::new();
         network.insert("block".to_string(), serde_json::Value::Bool(false));
         network.insert("allow_domain".to_string(), serde_json::Value::Array(vec![]));
+        network.insert("allow_ssh".to_string(), serde_json::Value::Array(vec![]));
         network.insert("credentials".to_string(), serde_json::Value::Array(vec![]));
         network.insert("open_port".to_string(), serde_json::Value::Array(vec![]));
         network.insert("listen_port".to_string(), serde_json::Value::Array(vec![]));
@@ -1038,6 +1039,7 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
     let has_net = net.block
         || net.resolved_network_profile().is_some()
         || !net.allow_domain.is_empty()
+        || !net.allow_ssh.is_empty()
         || !net.resolved_credentials().is_empty()
         || !net.open_port.is_empty()
         || !net.listen_port.is_empty()
@@ -1073,6 +1075,13 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 "    {}: {}",
                 theme::fg("allow_domain", t.subtext),
                 display.join(", ")
+            );
+        }
+        if !net.allow_ssh.is_empty() {
+            println!(
+                "    {}: {}",
+                theme::fg("allow_ssh", t.subtext),
+                net.allow_ssh.join(", ")
             );
         }
         if !net.resolved_credentials().is_empty() {
@@ -1335,6 +1344,7 @@ fn profile_to_json(
         "block": profile.network.block,
         "network_profile": profile.network.resolved_network_profile(),
         "allow_domain": profile.network.allow_domain,
+        "allow_ssh": profile.network.allow_ssh,
         "credentials": profile.network.resolved_credentials(),
         "open_port": profile.network.open_port,
         "listen_port": profile.network.listen_port,
@@ -1599,6 +1609,7 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         .collect();
     let net_vec_diffs = diff_string_vecs(&[
         ("allow_domain", &p1_allow_domain_strs, &p2_allow_domain_strs),
+        ("allow_ssh", &p1.network.allow_ssh, &p2.network.allow_ssh),
         (
             "credentials",
             p1.network.resolved_credentials(),
@@ -2116,6 +2127,7 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
                 "changed": p1.network.resolved_network_profile() != p2.network.resolved_network_profile(),
             },
             "allow_domain": diff_vec(&p1_allow_domain_strs, &p2_allow_domain_strs),
+            "allow_ssh": diff_vec(&p1.network.allow_ssh, &p2.network.allow_ssh),
             "credentials": diff_vec(p1.network.resolved_credentials(), p2.network.resolved_credentials()),
             "open_port": {
                 "profile1": p1.network.open_port,

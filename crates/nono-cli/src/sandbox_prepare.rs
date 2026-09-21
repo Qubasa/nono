@@ -527,6 +527,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) rollback_exclude_globs: Vec<String>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
+    pub(crate) allow_ssh: Vec<String>,
     pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
@@ -871,6 +872,7 @@ fn has_proxy_intent(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
         || !prepared.custom_credentials.is_empty()
         || prepared.network_profile.is_some()
         || !prepared.allow_domain.is_empty()
+        || !prepared.allow_ssh.is_empty()
         || prepared.upstream_proxy.is_some()
 }
 
@@ -941,6 +943,16 @@ pub(crate) fn validate_block_net_conflicts(
             return Err(NonoError::ConfigParse(
                 "--block-net and --allow-domain are contradictory: \
                  domain filtering requires proxy mode"
+                    .to_string(),
+            ));
+        }
+
+        // --allow-ssh routes SSH through the proxy CONNECT tunnel.
+        let has_allow_ssh = !args.allow_ssh.is_empty() || !prepared.allow_ssh.is_empty();
+        if has_allow_ssh {
+            return Err(NonoError::ConfigParse(
+                "--block-net and --allow-ssh are contradictory: \
+                 SSH egress pinning requires proxy mode"
                     .to_string(),
             ));
         }
@@ -1506,6 +1518,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 rollback_exclude_globs,
                 network_profile: None,
                 allow_domain,
+                allow_ssh: Vec::new(),
                 deny_domain: Vec::new(),
                 credentials,
                 custom_credentials,
@@ -1568,6 +1581,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         rollback_exclude_globs: profile_rollback_globs,
         network_profile: profile_network_profile,
         allow_domain: profile_allow_domain,
+        allow_ssh: profile_allow_ssh,
         deny_domain: profile_deny_domain,
         credentials: profile_credentials,
         custom_credentials: profile_custom_credentials,
@@ -1899,6 +1913,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             rollback_exclude_globs: profile_rollback_globs,
             network_profile: profile_network_profile,
             allow_domain: profile_allow_domain,
+            allow_ssh: profile_allow_ssh,
             deny_domain: profile_deny_domain,
             credentials: profile_credentials,
             custom_credentials: profile_custom_credentials,
@@ -2880,6 +2895,7 @@ mod tests {
             rollback_exclude_globs: Vec::new(),
             network_profile: None,
             allow_domain: Vec::new(),
+            allow_ssh: Vec::new(),
             deny_domain: Vec::new(),
             credentials: Vec::new(),
             custom_credentials: std::collections::HashMap::new(),
@@ -2964,6 +2980,34 @@ mod tests {
         assert!(
             err.to_string().contains("--block-net") && err.to_string().contains("--allow-domain"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn block_net_with_allow_ssh_errors() {
+        let args = SandboxArgs {
+            block_net: true,
+            allow_ssh: vec!["build.example.com".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --block-net + --allow-ssh");
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--allow-ssh"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn allow_ssh_alone_requires_the_proxy() {
+        let args = SandboxArgs {
+            allow_ssh: vec!["build.example.com".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            has_proxy_intent(&args, &empty_prepared()),
+            "an SSH allowance must be enough to start the proxy on its own"
         );
     }
 

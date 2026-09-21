@@ -1296,6 +1296,7 @@ fn validate_profile_no_proxy(profile: &Profile) -> Result<()> {
     validate_no_proxy_allow_domain_conflicts(
         &profile.network.no_proxy,
         &profile.network.allow_domain,
+        &profile.network.allow_ssh,
     )
 }
 
@@ -1333,10 +1334,21 @@ fn validate_profile_domain_patterns(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
-#[must_use = "network.no_proxy allow_domain conflict validation result must be handled"]
+/// Validate `network.allow_ssh` entries: one concrete host, port 1-65535.
+fn validate_profile_ssh_endpoints(profile: &Profile) -> Result<()> {
+    for entry in &profile.network.allow_ssh {
+        crate::network_policy::parse_ssh_endpoint(entry).map_err(|err| {
+            NonoError::ProfileParse(format!("network.allow_ssh entry invalid: {err}"))
+        })?;
+    }
+    Ok(())
+}
+
+#[must_use = "network.no_proxy conflict validation result must be handled"]
 pub(crate) fn validate_no_proxy_allow_domain_conflicts(
     no_proxy: &[String],
     allow_domain: &[AllowDomainEntry],
+    allow_ssh: &[String],
 ) -> Result<()> {
     for allow_entry in allow_domain {
         let domain = allow_entry.domain();
@@ -1346,6 +1358,18 @@ pub(crate) fn validate_no_proxy_allow_domain_conflicts(
                     "network.no_proxy entry '{no_proxy_entry}' conflicts with \
                      network.allow_domain entry '{domain}': allow_domain traffic must \
                      go through the proxy allowlist/L7 route, not bypass it"
+                )));
+            }
+        }
+    }
+    for entry in allow_ssh {
+        let (host, _) = crate::network_policy::parse_ssh_endpoint(entry)?;
+        for no_proxy_entry in no_proxy {
+            if nono_proxy::config::no_proxy_entry_overlaps_host_pattern(no_proxy_entry, &host) {
+                return Err(NonoError::ProfileParse(format!(
+                    "network.no_proxy entry '{no_proxy_entry}' conflicts with \
+                     network.allow_ssh entry '{entry}': the SSH route must go through \
+                     the proxy allowlist, not bypass it"
                 )));
             }
         }
@@ -1788,6 +1812,12 @@ pub struct NetworkConfig {
     /// Entries can be plain hostname strings or objects with endpoint rules.
     #[serde(default, rename = "allow_domain")]
     pub allow_domain: Vec<AllowDomainEntry>,
+    /// SSH endpoints the sandbox may reach, as `[user@]host[:port]`.
+    ///
+    /// Unlike `allow_domain`, entries are port-exact: the port defaults to 22
+    /// and no other port on the same host is permitted. Wildcards are rejected.
+    #[serde(default)]
+    pub allow_ssh: Vec<String>,
     /// Domains to deny through the proxy regardless of the allowlist.
     /// Supports the same wildcard syntax as `allow_domain` (e.g. `*.ads.example.com`).
     #[serde(default)]
@@ -3219,6 +3249,7 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     }
     validate_profile_env_var_patterns(&profile)?;
     validate_profile_domain_patterns(&profile)?;
+    validate_profile_ssh_endpoints(&profile)?;
     merge_implicit_default_groups(&mut profile)?;
     // Re-run after extends/platform overrides: base and child profiles can
     // independently add no_proxy and allow_domain entries that only conflict
@@ -3355,6 +3386,7 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     }
     validate_profile_env_var_patterns(&profile)?;
     validate_profile_domain_patterns(&profile)?;
+    validate_profile_ssh_endpoints(&profile)?;
 
     validate_command_policies(
         profile.command_policies.as_ref(),
@@ -3770,6 +3802,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.network.allow_domain,
                 &child.network.allow_domain,
             ),
+            allow_ssh: dedup_append(&base.network.allow_ssh, &child.network.allow_ssh),
             deny_domain: dedup_append(&base.network.deny_domain, &child.network.deny_domain),
             open_port: dedup_append(&base.network.open_port, &child.network.open_port),
             open_port_range: dedup_append(
@@ -6851,6 +6884,7 @@ mod tests {
                 allow_http2: false,
                 network_profile: InheritableValue::Set("base-net".to_string()),
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
+                allow_ssh: vec!["base.example.com".to_string()],
                 deny_domain: vec![],
                 open_port: vec![3000],
                 open_port_range: vec![],
@@ -6942,6 +6976,10 @@ mod tests {
                 allow_http2: false,
                 network_profile: InheritableValue::Inherit,
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
+                allow_ssh: vec![
+                    "base.example.com".to_string(),
+                    "deploy@child.example.com:2222".to_string(),
+                ],
                 deny_domain: vec![],
                 open_port: vec![3000, 5000],
                 open_port_range: vec![],
@@ -7025,6 +7063,18 @@ mod tests {
         assert_eq!(
             merged.network.no_proxy,
             vec!["base.local".to_string(), "child.local".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_deduplicates_allow_ssh() {
+        let merged = merge_profiles(base_profile(), child_profile());
+        assert_eq!(
+            merged.network.allow_ssh,
+            vec![
+                "base.example.com".to_string(),
+                "deploy@child.example.com:2222".to_string()
+            ]
         );
     }
 
@@ -8709,6 +8759,64 @@ mod tests {
             "inherited allow_domain/no_proxy conflicts must fail after profile merge"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_network_allow_ssh_parses_and_survives_deny_unknown_fields() -> Result<()> {
+        let profile = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "ssh" },
+                "network": { "allow_ssh": ["deploy@build.example.com:2222"] }
+            }"#,
+        )?;
+        assert_eq!(profile.network.allow_ssh, vec!["deploy@build.example.com:2222"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_allow_ssh_rejects_unusable_entries() {
+        for entry in [
+            "*.example.com",
+            "build.example.com:0",
+            "build.example.com:70000",
+            "build.example.com:ssh",
+            "::1",
+        ] {
+            let json = format!(
+                r#"{{
+                    "meta": {{ "name": "bad-ssh" }},
+                    "network": {{ "allow_ssh": ["{entry}"] }}
+                }}"#
+            );
+            let err = parse_profile_bytes(json.as_bytes())
+                .expect_err("entry must be rejected at load time")
+                .to_string();
+            assert!(
+                err.contains(entry),
+                "error for '{entry}' must name the entry, got: {err}"
+            );
+        }
+    }
+
+    /// An SSH host in `no_proxy` would hand the sandbox a route the
+    /// allowlist never sees.
+    #[test]
+    fn test_network_no_proxy_rejects_allow_ssh_overlap() {
+        let err = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "bad-ssh-no-proxy" },
+                "network": {
+                    "allow_ssh": ["deploy@build.internal.corp"],
+                    "no_proxy": [".internal.corp"]
+                }
+            }"#,
+        )
+        .expect_err("allow_ssh and no_proxy must conflict")
+        .to_string();
+        assert!(
+            err.contains("build.internal.corp") && err.contains(".internal.corp"),
+            "the error must name both entries, got: {err}"
+        );
     }
 
     #[test]

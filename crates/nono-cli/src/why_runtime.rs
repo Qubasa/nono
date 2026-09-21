@@ -50,6 +50,11 @@ fn resolve_allowed_domains(profile: &profile::Profile) -> Result<Vec<String>> {
         &net_policy,
         &plain_entries,
     ));
+    // Port-exact: appended as `host:port` without `expand_proxy_allow`, which
+    // would strip the port and answer "allowed" for every port on that host.
+    domains.extend(network_policy::ssh_allowlist_entries(
+        &profile.network.allow_ssh,
+    )?);
 
     Ok(domains)
 }
@@ -68,7 +73,9 @@ fn resolve_denied_domains(profile: &profile::Profile) -> Result<Vec<String>> {
 fn merge_cli_allow_domains(
     mut domains: Vec<String>,
     cli_entries: &[String],
+    cli_ssh_entries: &[String],
 ) -> Result<Vec<String>> {
+    domains.extend(network_policy::ssh_allowlist_entries(cli_ssh_entries)?);
     if cli_entries.is_empty() {
         return Ok(domains);
     }
@@ -202,8 +209,11 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             }
         }
 
-        let allowed_domains =
-            merge_cli_allow_domains(resolve_allowed_domains(&profile)?, &args.allow_proxy)?;
+        let allowed_domains = merge_cli_allow_domains(
+            resolve_allowed_domains(&profile)?,
+            &args.allow_proxy,
+            &args.allow_ssh,
+        )?;
         let denied_domains =
             merge_cli_deny_domains(resolve_denied_domains(&profile)?, &args.deny_proxy)?;
         let domain_endpoints = resolve_domain_endpoints(&profile);
@@ -245,7 +255,11 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             caps,
             deny_paths: prepared.deny_paths,
             overridden_paths: vec![],
-            allowed_domains: merge_cli_allow_domains(Vec::new(), &args.allow_proxy)?,
+            allowed_domains: merge_cli_allow_domains(
+                Vec::new(),
+                &args.allow_proxy,
+                &args.allow_ssh,
+            )?,
             denied_domains: merge_cli_deny_domains(Vec::new(), &args.deny_proxy)?,
             domain_endpoints: vec![],
             command_policies: None,

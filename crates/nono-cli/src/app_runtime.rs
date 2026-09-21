@@ -144,6 +144,7 @@ fn dispatch_command(
         }
         Commands::OpenUrlHelper(args) => run_open_url_helper(args),
         Commands::PackUpdateHintHelper(args) => crate::pack_update_hint::run_refresh_helper(args),
+        Commands::SshTunnel(args) => crate::ssh_tunnel::run_ssh_tunnel(args),
         Commands::Completions(args) => run_completions(args),
     }
 }

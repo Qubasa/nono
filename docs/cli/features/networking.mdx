@@ -26,7 +26,7 @@ The proxy supports three modes that can be combined in a single session:
 
 | Mode | What it does | Activated by |
 |------|-------------|--------------|
-| **CONNECT tunnel** | Domain-filtered HTTPS tunneling. Validates the target host against an allowlist, then relays raw TCP bytes. TLS is end-to-end — the proxy never sees plaintext. | `--allow-domain`, `--network-profile` |
+| **CONNECT tunnel** | Domain-filtered HTTPS tunneling. Validates the target host against an allowlist, then relays raw TCP bytes. TLS is end-to-end — the proxy never sees plaintext. | `--allow-domain`, `--allow-ssh`, `--network-profile` |
 | **Reverse proxy** | Credential injection for API calls. Requests arrive at `http://localhost:<port>/<service>/...`, the proxy injects the real API key and forwards to the upstream over TLS. | `--credential` |
 | **External proxy** | Enterprise proxy passthrough. CONNECT requests are chained through a corporate proxy. Cloud metadata endpoints are still denied. | `--upstream-proxy` |
 
@@ -148,6 +148,93 @@ nono run --allow-cwd --network-profile developer --allow-domain my-internal-api.
 - `*` occupying a whole label anywhere else matches exactly one label there: `jenkins.*.ci.example.com` matches `jenkins.prod.ci.example.com`, but not `jenkins.ci.example.com` (missing label) or `jenkins.a.b.ci.example.com` (extra label).
 
 A `*` that only occupies part of a label (`foo*bar.com`), or a leading `*.` combined with another `*` elsewhere in the same pattern, can never match a real hostname — these are rejected at profile load time rather than silently matching nothing.
+
+### SSH Egress Pinning
+
+`network.allow_ssh` (CLI: `--allow-ssh`, repeatable, reads `NONO_ALLOW_SSH`) allows SSH to specific endpoints through the same CONNECT tunnel. Unlike `allow_domain`, each entry is pinned to one port.
+
+```json
+{
+  "meta": { "name": "git-ssh" },
+  "filesystem": { "allow": ["$WORKDIR"] },
+  "network": {
+    "allow_ssh": ["git@build.example.com"]
+  }
+}
+```
+
+```bash
+nono run --allow-cwd --allow-ssh build.example.com -- git fetch
+```
+
+`allow_ssh` is the only network key in that profile, and that is enough: it activates proxy mode on its own. The session gets a running proxy, `ProxyOnly` network mode, and an active allowlist — everything not allowed is refused.
+
+#### Entry Syntax and Port Exactness
+
+Entries are `[user@]host[:port]`. The port defaults to `22`, and any `user@` prefix is accepted and ignored, so an SSH target copied out of a shell command pastes verbatim. IPv6 literals must be bracketed (`[::1]:22`). Wildcards (`*.example.com`), an empty host, a non-numeric port, and a port outside 1–65535 are rejected at profile load time; the error names the offending entry.
+
+| Key | What `build.example.com` grants |
+|-----|---------------------------------|
+| `allow_ssh` | `build.example.com:22` only. `build.example.com:443` is refused. |
+| `allow_domain` | The host on every port — any `:port` suffix is stripped, with a warning that the port is ignored. |
+
+`nono why --host build.example.com --port 443` reports `port_not_allowed` and names the port the host is actually allowed on. Configured endpoints appear in `nono profile show`, `nono profile show --json` (key `allow_ssh` under `network`), `nono profile diff` (also with `--json`), and `nono why --self`.
+
+Across profile inheritance, `allow_ssh` entries are appended and deduplicated, the same as `deny_domain` and `no_proxy`.
+
+#### Client Wiring
+
+When `allow_ssh` is active, nono materialises a generated OpenSSH config in a session-scoped `0700` directory and grants the sandbox read access to it:
+
+```
+Host *
+  ProxyCommand /path/to/nono ssh-tunnel %h %p
+```
+
+`nono ssh-tunnel` is a hidden helper subcommand (an HTTP CONNECT client) that exists for this `ProxyCommand`; it is not a user-facing command. Two environment tweaks point clients at the generated config:
+
+- `GIT_SSH_COMMAND="ssh -F <config>"`, so `git clone ssh://…` works unmodified.
+- A directory containing a generated `ssh` wrapper is prepended to the child's `PATH`, so an `ssh` that the sandboxed process resolves itself — from a shell, a build script, a `Makefile` — picks the config up too. It is not installed under Tool Sandbox, where the shim directory owns `ssh` on `PATH`.
+
+Both are removed when the session ends.
+
+<Note>
+  The generated config and the PATH wrapper are ergonomics, not enforcement. Invoking `/usr/bin/ssh` by absolute path skips both and fails closed with `EACCES` — bypassing the wrapper never widens access. The enforcement boundary is the kernel destination pin: a seccomp user-notification filter that restricts `connect`/`sendto` to the proxy address.
+</Note>
+
+<Note>
+  `nono run --allow-ssh host -- ssh host` is also not covered by the wrapper: nono resolves the top-level program against the *host* `PATH` before the sandbox exists, so that `ssh` is the real binary and fails with `EACCES`. Reach it through a shell instead — `nono run --allow-ssh host -- sh -c 'ssh host'` — or use `git`, which honours `GIT_SSH_COMMAND`.
+</Note>
+
+<Note>
+  Both wiring paths pass `ssh -F <config>`, which makes the generated file the client's entire configuration: `~/.ssh/config` and `/etc/ssh/ssh_config` are not read. Pass per-session client options as `ssh -o …` (or `GIT_SSH_COMMAND="ssh -F <config> -o …"`) rather than relying on your own config file.
+</Note>
+
+#### Rejected Combinations
+
+Each of these is refused before the sandbox starts:
+
+| Combination | Reason |
+|-------------|--------|
+| `--block-net` with `--allow-ssh` | Contradictory: SSH egress pinning requires proxy mode. |
+| `--allow-net` with `--allow-ssh` | `--allow-net` bypasses the proxy entirely, so the destination pin could not apply. |
+| A host in both `allow_ssh` and `network.no_proxy` | The SSH route must go through the proxy allowlist, not bypass it. |
+| Any configuration where the seccomp-notify supervisor is not installed | The supervisor is the destination pin. This covers `linux.sandbox_policy` of `landlock` or `external`, and WSL2, where seccomp notify returns `EBUSY`. Landlock filters by port only, so the "just this endpoint" allowance could not be kernel-enforced. |
+
+The refusal is keyed off whether the pin will actually be installed, not off a list of policy names, so `allow_ssh` on WSL2 is rejected outright rather than degrading through `security.wsl2_proxy_policy`. See [Credential Proxy on WSL2](/cli/internals/wsl2#credential-proxy-on-wsl2).
+
+#### Key Posture
+
+Grant one dedicated SSH key with `filesystem.read_file`, and pass `-o IdentitiesOnly=yes` so the client offers only that key. It has to be a command-line option: the generated config is passed with `ssh -F`, so `~/.ssh/config` is not read inside the session.
+
+```json
+{
+  "filesystem": { "read_file": ["$HOME/.ssh/id_build"] },
+  "network": { "allow_ssh": ["git@build.example.com"] }
+}
+```
+
+Forwarding `$SSH_AUTH_SOCK` into the sandbox instead (via `filesystem.unix_socket`) weakens the guarantee: the agent can sign for every key it holds, and the sandboxed process can use any of them for the duration of the session. `tool-sandbox-examples/git-ssh/` demonstrates the agent-forwarding setup.
 
 ### Denying Domains
 
@@ -283,6 +370,7 @@ Settings are loaded from `--profile` and extended/overridden by explicit flags, 
 | `--max-connections <N>` | Maximum concurrent client connections (`0` = unlimited, default `256`). Raise for highly parallel clients such as `docker pull`. Reads `NONO_PROXY_MAX_CONNECTIONS`. |
 | `--network-profile <PROFILE>` | Enable a named network profile (e.g. `developer`). |
 | `--allow-domain <DOMAIN_OR_URL>` | Add a domain (or path-scoped URL) to the allowlist (repeatable). |
+| `--allow-ssh <SSH_TARGET>` | Allow one SSH endpoint as `[user@]host[:port]`, port-exact, default port 22 (repeatable). |
 | `--credential <SERVICE>` | Inject credentials for a service via the reverse proxy (repeatable). |
 | `--allow-endpoint <SERVICE:METHOD:PATH>` | Restrict a credential service to specific HTTP method+path patterns (repeatable). See [Endpoint Filtering](#endpoint-filtering). |
 | `--upstream-proxy <HOST:PORT>` | Chain outbound traffic through an upstream proxy. |

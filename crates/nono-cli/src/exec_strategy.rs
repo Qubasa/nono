@@ -319,6 +319,9 @@ pub struct ExecConfig<'a> {
     /// env filtering and before `env_vars` (credentials/proxy/hooks). Values are
     /// already variable-expanded. Bypasses allow/deny filtering by design.
     pub set_vars: Vec<(String, String)>,
+    /// Directory holding the generated `ssh` wrapper, prepended to the
+    /// child's `PATH` when `network.allow_ssh` is in effect.
+    pub ssh_path_dir: Option<&'a std::path::Path>,
     /// Prepared tool-sandbox runtime. When present, the outer child gets shims on PATH
     /// and an additional Linux execute-only Landlock gate.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -686,6 +689,27 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
         kv.push(b'=');
         kv.extend_from_slice(value.as_bytes());
         if let Ok(cstr) = CString::new(kv) {
+            env_c.push(cstr);
+        }
+    }
+
+    // Put the generated `ssh` wrapper ahead of the real one. Read the current
+    // PATH back out of `env_c` so profile env filtering still decides the rest
+    // of it. Never set under Tool Sandbox, whose shim dir owns `ssh`.
+    if let Some(ssh_dir) = config.ssh_path_dir {
+        let current_path = env_c
+            .iter()
+            .find_map(|entry| {
+                entry
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.strip_prefix("PATH="))
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+        let new_path = format!("PATH={}:{current_path}", ssh_dir.display());
+        if let Ok(cstr) = CString::new(new_path) {
+            env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
             env_c.push(cstr);
         }
     }
