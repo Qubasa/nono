@@ -19,7 +19,7 @@ fn proxy_address() -> Result<String> {
         .iter()
         .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
         .ok_or_else(|| {
-            NonoError::ConfigParse(
+            NonoError::SshTunnel(
                 "nono ssh-tunnel: HTTPS_PROXY is not set — this command only runs inside a \
                  nono sandbox with proxy mode active"
                     .to_string(),
@@ -27,10 +27,10 @@ fn proxy_address() -> Result<String> {
         })?;
 
     let url = url::Url::parse(&raw).map_err(|err| {
-        NonoError::ConfigParse(format!("nono ssh-tunnel: HTTPS_PROXY is not a URL: {err}"))
+        NonoError::SshTunnel(format!("nono ssh-tunnel: HTTPS_PROXY is not a URL: {err}"))
     })?;
     let host = url.host_str().ok_or_else(|| {
-        NonoError::ConfigParse("nono ssh-tunnel: HTTPS_PROXY has no host".to_string())
+        NonoError::SshTunnel("nono ssh-tunnel: HTTPS_PROXY has no host".to_string())
     })?;
     let port = url.port().unwrap_or(80);
     Ok(format!("{host}:{port}"))
@@ -47,7 +47,7 @@ pub(crate) fn run_ssh_tunnel(args: SshTunnelArgs) -> Result<()> {
         .enable_all()
         .build()
         .map_err(|err| {
-            NonoError::ConfigParse(format!("nono ssh-tunnel: could not start runtime: {err}"))
+            NonoError::SshTunnel(format!("nono ssh-tunnel: could not start runtime: {err}"))
         })?;
 
     runtime.block_on(tunnel(&proxy_addr, &args.host, args.port, auth.as_deref()))
@@ -62,7 +62,7 @@ async fn tunnel(
     let stream = nono_proxy::external::connect_via_proxy(proxy_addr, host, port, proxy_auth_header)
         .await
         .map_err(|err| {
-            NonoError::ConfigParse(format!(
+            NonoError::SshTunnel(format!(
                 "nono ssh-tunnel: proxy refused a connection to {host}:{port}: {err}"
             ))
         })?;
