@@ -7,6 +7,7 @@
 use crate::config::{is_proxy_denied_metadata_ip, parse_host_ip_literal};
 use crate::error::Result;
 use nono::net_filter::{FilterResult, HostFilter};
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use tracing::debug;
 
@@ -26,6 +27,26 @@ pub struct CheckResult {
 #[derive(Debug, Clone)]
 pub struct ProxyFilter {
     inner: HostFilter,
+    ssh_pins: SshPins,
+}
+
+/// Port-exact SSH endpoints: every port named here is closed on every host
+/// that is not listed, whatever the allowlist says.
+///
+/// This is what makes `network.allow_ssh` narrowing. The allowlist alone
+/// cannot express it: an empty allowlist means allow-all, so adding the
+/// endpoint to it would either change nothing or, if it were the only
+/// entry, close every other destination too.
+#[derive(Debug, Clone, Default)]
+struct SshPins {
+    ports: BTreeSet<u16>,
+    authorities: BTreeSet<String>,
+}
+
+impl SshPins {
+    fn denies(&self, authority: &str, port: u16) -> bool {
+        self.ports.contains(&port) && !self.authorities.contains(authority)
+    }
 }
 
 impl ProxyFilter {
@@ -34,6 +55,7 @@ impl ProxyFilter {
     pub fn new(allowed_hosts: &[String]) -> Self {
         Self {
             inner: HostFilter::new(allowed_hosts),
+            ssh_pins: SshPins::default(),
         }
     }
 
@@ -42,6 +64,7 @@ impl ProxyFilter {
     pub fn new_strict(allowed_hosts: &[String]) -> Self {
         Self {
             inner: HostFilter::new_strict(allowed_hosts),
+            ssh_pins: SshPins::default(),
         }
     }
 
@@ -50,6 +73,7 @@ impl ProxyFilter {
     pub fn allow_all() -> Self {
         Self {
             inner: HostFilter::allow_all(),
+            ssh_pins: SshPins::default(),
         }
     }
 
@@ -63,7 +87,28 @@ impl ProxyFilter {
         }
         Self {
             inner: self.inner.with_denied_hosts(denied),
+            ssh_pins: self.ssh_pins,
         }
+    }
+
+    /// Pin the ports named by `network.allow_ssh` to the hosts listed.
+    ///
+    /// Entries are `host:port`. Each port becomes unreachable on every other
+    /// host, so a lone SSH allowance narrows port 22 without closing any
+    /// other port. An entry that is not `host:port` is dropped with a
+    /// warning: it can only ever have contributed a deny, so dropping it
+    /// leaves the port as open as it was, never more open.
+    #[must_use]
+    pub fn with_ssh_endpoints(mut self, endpoints: &[String]) -> Self {
+        for entry in endpoints {
+            let Some((host, port)) = split_authority(entry) else {
+                tracing::warn!("ignoring malformed allow_ssh endpoint: {entry}");
+                continue;
+            };
+            self.ssh_pins.ports.insert(port);
+            self.ssh_pins.authorities.insert(authority(&host, port));
+        }
+        self
     }
 
     /// Check a host against the filter with async DNS resolution.
@@ -123,19 +168,15 @@ impl ProxyFilter {
             .unwrap_or_else(|| self.inner.check_host(host, resolved_ips))
     }
 
-    /// Checks deny (incl. `host:port`) before the allowlist, so a wildcard
-    /// `allow_domain: ["*"]` can't shadow a port-scoped deny entry.
+    /// Checks the SSH pins and deny (incl. `host:port`) before the allowlist,
+    /// so neither a wildcard `allow_domain: ["*"]` nor an empty allowlist can
+    /// shadow a port-scoped refusal.
     fn check_host_result(&self, host: &str, port: u16, resolved_ips: &[IpAddr]) -> FilterResult {
-        // Normalize before appending the port: a raw trailing dot would land
-        // mid-string (e.g. "evil.com.:443"), past where normalization looks.
-        let normalized_host = HostFilter::normalize_authority_host(host);
-        // Bracket IPv6 literals so their embedded colons can't be mistaken
-        // for the port separator (e.g. "[::1]:8975", not "::1:8975").
-        let host_port = if normalized_host.parse::<Ipv6Addr>().is_ok() {
-            format!("[{normalized_host}]:{port}")
-        } else {
-            format!("{normalized_host}:{port}")
-        };
+        let host_port = authority(host, port);
+
+        if self.ssh_pins.denies(&host_port, port) {
+            return FilterResult::DenyNotAllowed { host: host_port };
+        }
 
         if let Some(deny) = self.inner.check_deny(&host_port) {
             return deny;
@@ -157,6 +198,32 @@ impl ProxyFilter {
     pub fn allowed_count(&self) -> usize {
         self.inner.allowed_count()
     }
+}
+
+/// Canonical `host:port`, normalized and IPv6-bracketed.
+///
+/// Normalize before appending the port: a raw trailing dot would otherwise
+/// land mid-string (e.g. "evil.com.:443"), past where normalization looks.
+/// Brackets keep an IPv6 literal's own colons out of the port separator
+/// (e.g. "[::1]:8975", not "::1:8975").
+fn authority(host: &str, port: u16) -> String {
+    let normalized = HostFilter::normalize_authority_host(host);
+    if normalized.parse::<Ipv6Addr>().is_ok() {
+        format!("[{normalized}]:{port}")
+    } else {
+        format!("{normalized}:{port}")
+    }
+}
+
+/// Split `host:port`, tolerating a bracketed IPv6 literal.
+fn split_authority(entry: &str) -> Option<(String, u16)> {
+    let (host, port) = entry.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(inner) => inner,
+        None => host,
+    };
+    Some((host.to_string(), port))
 }
 
 fn proxy_metadata_filter_result(host: &str, resolved_ips: &[IpAddr]) -> Option<FilterResult> {
@@ -198,6 +265,57 @@ mod tests {
 
         let result = filter.check_host_result("platform.claude.com", 8443, &public_ip);
         assert!(!result.is_allowed());
+    }
+
+    /// The whole point of `allow_ssh`: on an open policy it must close the
+    /// SSH port everywhere else without closing any other port.
+    #[test]
+    fn test_ssh_pins_narrow_only_their_own_port() {
+        let ip = vec![IpAddr::V4(Ipv4Addr::new(5, 9, 99, 136))];
+        let filter =
+            ProxyFilter::allow_all().with_ssh_endpoints(&["5.9.99.136:22".to_string()]);
+
+        assert!(filter.check_host_result("5.9.99.136", 22, &ip).is_allowed());
+        assert!(!filter.check_host_result("gchq.icu", 22, &ip).is_allowed());
+        assert!(filter.check_host_result("gchq.icu", 443, &ip).is_allowed());
+        assert!(
+            filter.check_host_result("5.9.99.136", 443, &ip).is_allowed(),
+            "a pin closes its port, not its host: HTTPS to that host is \
+             no more restricted than HTTPS anywhere else"
+        );
+    }
+
+    /// A wildcard allowlist entry must not reopen a pinned port.
+    #[test]
+    fn test_ssh_pins_outrank_a_wildcard_allowlist() {
+        let ip = vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))];
+        let filter = ProxyFilter::new(&["*".to_string()])
+            .with_ssh_endpoints(&["build.example.com:22".to_string()]);
+
+        assert!(!filter.check_host_result("evil.com", 22, &ip).is_allowed());
+        assert!(filter.check_host_result("evil.com", 80, &ip).is_allowed());
+    }
+
+    /// Entries and incoming hosts are normalized the same way, so a trailing
+    /// dot or a different case cannot slip past the pin.
+    #[test]
+    fn test_ssh_pins_normalize_both_sides() {
+        let ip = vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))];
+        let filter = ProxyFilter::allow_all()
+            .with_ssh_endpoints(&["Build.Example.com.:22".to_string()]);
+
+        assert!(filter.check_host_result("build.example.com", 22, &ip).is_allowed());
+        assert!(filter.check_host_result("BUILD.example.com.", 22, &ip).is_allowed());
+        assert!(!filter.check_host_result("build.example.com.evil.com", 22, &ip).is_allowed());
+    }
+
+    #[test]
+    fn test_ssh_pins_accept_bracketed_ipv6_entries() {
+        let ip = vec![IpAddr::V6(Ipv6Addr::LOCALHOST)];
+        let filter = ProxyFilter::allow_all().with_ssh_endpoints(&["[::1]:2222".to_string()]);
+
+        assert!(filter.check_host_result("::1", 2222, &ip).is_allowed());
+        assert!(!filter.check_host_result("::2", 2222, &ip).is_allowed());
     }
 
     #[test]

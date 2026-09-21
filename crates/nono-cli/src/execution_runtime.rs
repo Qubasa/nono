@@ -318,14 +318,24 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } else {
         plain_domain_strs
     };
-    // Port-exact SSH endpoints join the state allowlist verbatim, so
-    // `nono why --self` sees the same `host:port` entries the proxy enforces.
+    // The pins are state of their own: they close a port everywhere else, so
+    // they are not allowlist entries. They still join the allowlist when one
+    // is active, matching `build_proxy_config_from_flags`, so `why --self`
+    // answers exactly what the proxy enforces.
+    let ssh_endpoint_strs: Vec<String> = {
+        let entries = domain_filter.map(|d| d.allow_ssh.as_slice()).unwrap_or(&[]);
+        match network_policy::ssh_allowlist_entries(entries) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!("failed to resolve allow_ssh entries for sandbox state: {e}");
+                Vec::new()
+            }
+        }
+    };
     let allowed_domain_strs: Vec<String> = {
         let mut domains = allowed_domain_strs;
-        let ssh_entries = domain_filter.map(|d| d.allow_ssh.as_slice()).unwrap_or(&[]);
-        match network_policy::ssh_allowlist_entries(ssh_entries) {
-            Ok(entries) => domains.extend(entries),
-            Err(e) => warn!("failed to resolve allow_ssh entries for sandbox state: {e}"),
+        if !domains.is_empty() {
+            domains.extend(ssh_endpoint_strs.iter().cloned());
         }
         domains
     };
@@ -369,6 +379,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         &deny_paths,
         &allowed_domain_strs,
         &denied_domain_strs,
+        &ssh_endpoint_strs,
         &domain_endpoints,
         flags.silent,
     );
@@ -894,6 +905,7 @@ fn write_capability_state_file(
     deny_paths: &[std::path::PathBuf],
     allowed_domains: &[String],
     denied_domains: &[String],
+    ssh_endpoints: &[String],
     domain_endpoints: &[sandbox_state::DomainEndpointState],
     silent: bool,
 ) -> Option<std::path::PathBuf> {
@@ -904,7 +916,8 @@ fn write_capability_state_file(
         allowed_domains,
         denied_domains,
         domain_endpoints,
-    );
+    )
+    .with_ssh_endpoints(ssh_endpoints);
 
     for _ in 0..8 {
         let cap_file = next_capability_state_file_path();

@@ -46,6 +46,14 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub denied_hosts: Vec<String>,
 
+    /// Port-exact SSH endpoints (`host:port`) from `network.allow_ssh`.
+    ///
+    /// Every port named here becomes closed on every other host: the filter
+    /// denies `host:port` unless that authority is listed. This narrows an
+    /// open policy without touching any other port.
+    #[serde(default)]
+    pub ssh_endpoints: Vec<String>,
+
     /// When `true`, an empty `allowed_hosts` denies every host instead of
     /// falling back to allow-all.
     #[serde(default)]
@@ -261,6 +269,7 @@ impl Default for ProxyConfig {
             bind_port: 0,
             allowed_hosts: Vec::new(),
             denied_hosts: Vec::new(),
+            ssh_endpoints: Vec::new(),
             strict_filter: false,
             require_auth: default_require_auth(),
             strict_connect_auth: false,

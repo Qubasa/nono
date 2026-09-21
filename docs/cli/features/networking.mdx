@@ -169,18 +169,28 @@ nono run --allow-cwd --allow-ssh build.example.com -- git fetch
 
 `allow_ssh` is the only network key in that profile, and that is enough: it activates proxy mode on its own. The session gets a running proxy and `ProxyOnly` network mode.
 
-It only ever adds. A profile with no `allow_domain` and no `network_profile` has an open allowlist, and `allow_ssh` leaves it open: the SSH route is wired up and every other destination stays as reachable as it was. Port exactness therefore describes what `allow_ssh` contributes to an allowlist that some other key already activated — writing the endpoint into an empty allowlist would silently make SSH the only thing the session could reach.
+Each entry does two things. It **grants** its own `host:port`, and it **pins** that port: every port named by an `allow_ssh` entry becomes closed on every host the entry list does not name. The pin is what makes the allowance mean something on an open policy. A profile with no `allow_domain` and no `network_profile` reaches everything, and adding `--allow-ssh build.example.com` to it does not close HTTPS to anywhere - it closes **port 22** everywhere except `build.example.com`.
+
+```bash
+nono run --allow-cwd --allow-ssh build.example.com -- sh -c '
+  ssh build.example.com     # reaches the host
+  ssh other.example.com     # 403: port 22 is pinned elsewhere
+  curl https://example.com  # 200: the pin does not touch port 443
+'
+```
+
+The pin is evaluated before the allowlist and before `allow_domain`, so a wildcard `allow_domain: ["*"]` cannot reopen a pinned port.
 
 #### Entry Syntax and Port Exactness
 
-Entries are `[user@]host[:port]`. The port defaults to `22`, and any `user@` prefix is accepted and ignored, so an SSH target copied out of a shell command pastes verbatim. IPv6 literals must be bracketed (`[::1]:22`). Wildcards (`*.example.com`), an empty host, a non-numeric port, and a port outside 1–65535 are rejected at profile load time; the error names the offending entry.
+Entries are `[user@]host[:port]`. The port defaults to `22`, and any `user@` prefix is accepted and ignored, so an SSH target copied out of a shell command pastes verbatim. IPv6 literals must be bracketed (`[::1]:22`). Wildcards (`*.example.com`), an empty host, a non-numeric port, and a port outside 1-65535 are rejected at profile load time; the error names the offending entry.
 
-| Key | What `build.example.com` grants |
-|-----|---------------------------------|
-| `allow_ssh` | `build.example.com:22` only, and `build.example.com:443` is refused — once something else has activated the allowlist. |
-| `allow_domain` | The host on every port — any `:port` suffix is stripped, with a warning that the port is ignored. |
+| Key | What `build.example.com` does |
+|-----|-------------------------------|
+| `allow_ssh` | Grants `build.example.com:22`, and closes port 22 on every other host. Other ports are untouched. |
+| `allow_domain` | Grants the host on every port - any `:port` suffix is stripped, with a warning that the port is ignored. |
 
-`nono why --host build.example.com --port 443` reports `port_not_allowed` and names the port the host is actually allowed on. Configured endpoints appear in `nono profile show`, `nono profile show --json` (key `allow_ssh` under `network`), `nono profile diff` (also with `--json`), and `nono why --self`.
+Two different refusals report this. `nono why --host other.example.com --port 22` reports `ssh_port_pinned` and names the endpoints the port is pinned to. `nono why --host build.example.com --port 443`, on a policy that is already filtering, reports `port_not_allowed` and names the port the host is allowed on. Configured endpoints appear in `nono profile show`, `nono profile show --json` (key `allow_ssh` under `network`), `nono profile diff` (also with `--json`), and `nono why --self`.
 
 Across profile inheritance, `allow_ssh` entries are appended and deduplicated, the same as `deny_domain` and `no_proxy`.
 

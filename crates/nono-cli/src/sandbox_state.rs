@@ -46,6 +46,12 @@ pub struct SandboxState {
     /// Proxy domain denylist (`network.deny_domain`) at sandbox creation time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_domains: Vec<String>,
+    /// Port-exact `network.allow_ssh` authorities (`host:port`) in effect.
+    ///
+    /// Separate from `allowed_domains` because they deny rather than grant:
+    /// each named port is closed on every host not listed here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_endpoints: Vec<String>,
     /// Endpoint-restricted domains with method+path rules
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_endpoints: Vec<DomainEndpointState>,
@@ -180,9 +186,17 @@ impl SandboxState {
             deny_paths: deny_paths.iter().map(|p| p.display().to_string()).collect(),
             allowed_domains: allowed_domains.to_vec(),
             denied_domains: denied_domains.to_vec(),
+            ssh_endpoints: Vec::new(),
             domain_endpoints: domain_endpoints.to_vec(),
             resource_limits: caps.resource_limits().copied(),
         }
+    }
+
+    /// Record the port-exact SSH endpoints this sandbox was started with.
+    #[must_use]
+    pub fn with_ssh_endpoints(mut self, endpoints: &[String]) -> Self {
+        self.ssh_endpoints = endpoints.to_vec();
+        self
     }
 
     /// Get bypass_protection paths as PathBufs for query use

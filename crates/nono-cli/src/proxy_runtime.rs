@@ -2436,14 +2436,16 @@ pub(crate) fn build_proxy_config_from_flags(
         || !plain_hosts.is_empty()
         || !endpoint_routes.is_empty();
 
-    // Port-exact, and therefore appended *after* partitioning: going through
-    // `expand_proxy_allow` would strip the ":port" that makes the allowance
-    // name one service rather than a whole host. Only onto an allowlist that
-    // is already filtering, for the #1485 reason above: on an open policy
-    // these entries would be the whole allowlist and SSH would become the
-    // only reachable destination.
+    // Two different jobs. The pins below (`proxy_config.ssh_endpoints`) close
+    // the named port on every other host, which is what makes the allowance
+    // narrowing even on an open policy. The allowlist entry only grants, and
+    // is appended *after* partitioning because `expand_proxy_allow` would
+    // strip the ":port" that makes it name one service rather than a whole
+    // host. It is added only to an allowlist that is already filtering: on an
+    // open policy it would be the entire allowlist and SSH would become the
+    // only reachable destination (#1485).
     if host_allowlist_active {
-        plain_hosts.extend(ssh_hosts);
+        plain_hosts.extend(ssh_hosts.iter().cloned());
     }
 
     // Endpoint-restricted domains need filter allowlist access so the proxy
@@ -2502,6 +2504,7 @@ pub(crate) fn build_proxy_config_from_flags(
     let mut proxy_config =
         network_policy::build_proxy_config(&resolved, &plain_hosts, &denied_hosts);
     proxy_config.strict_filter = proxy.strict_filter;
+    proxy_config.ssh_endpoints = ssh_hosts;
 
     if let Some(ref upstream) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {

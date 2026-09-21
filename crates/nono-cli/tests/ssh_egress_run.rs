@@ -101,13 +101,61 @@ fn python3_bin() -> Option<String> {
     None
 }
 
-/// The allowlist has to be doing the deciding for port-exactness to mean
-/// anything, so every case here pairs the SSH allowance with an `allow_domain`
-/// entry. On an open policy `allow_ssh` only adds the mediated route.
+/// Paired with an `allow_domain` entry, so the allowlist is doing the
+/// deciding and `port_not_allowed` is what refuses the wrong port.
 fn filtered_profile(port: u16) -> String {
     profile_json(&format!(
         r#"{{"allow_domain":["example.invalid"],"allow_ssh":["127.0.0.1:{port}"]}}"#
     ))
+}
+
+/// No `allow_domain`: an open policy, where the port pin is the only thing
+/// that can refuse anything.
+fn open_profile(port: u16) -> String {
+    profile_json(&format!(r#"{{"allow_ssh":["127.0.0.1:{port}"]}}"#))
+}
+
+/// The hole this pin closes: on an open policy the allowance must still be an
+/// allowance, not a decoration. `localhost` is the same machine on the same
+/// pinned port, and is still refused, because the pin names an authority and
+/// nothing else may use that port.
+#[test]
+fn ssh_pin_refuses_another_host_on_an_open_policy() {
+    let server = BannerServer::start();
+    let t = nono_test!("ssh-egress-pin");
+    let profile = t.write_profile("ssh-pin", &open_profile(server.port));
+
+    t.run()
+        .profile(&profile)
+        .exec(
+            Argv::new(nono_bin())
+                .arg("ssh-tunnel")
+                .arg("localhost")
+                .arg(server.port.to_string()),
+        )
+        .assert_failure("an open policy must not leave the pinned port open elsewhere")
+        .assert_stdout_lacks("SSH-2.0-nono-test");
+}
+
+/// The other half of the same contract: the pin closes its port, not the box.
+/// A second endpoint on an unpinned port stays reachable on an open policy.
+#[test]
+fn ssh_pin_leaves_other_ports_open_on_an_open_policy() {
+    let server = BannerServer::start();
+    let other = BannerServer::start();
+    let t = nono_test!("ssh-egress-open");
+    let profile = t.write_profile("ssh-open", &open_profile(server.port));
+
+    t.run()
+        .profile(&profile)
+        .exec(
+            Argv::new(nono_bin())
+                .arg("ssh-tunnel")
+                .arg("127.0.0.1")
+                .arg(other.port.to_string()),
+        )
+        .assert_success("an open policy must stay open on every port the pin does not name")
+        .assert_stdout_contains("SSH-2.0-nono-test");
 }
 
 #[test]

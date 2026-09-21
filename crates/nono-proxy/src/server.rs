@@ -396,7 +396,8 @@ impl ProxyHandle {
         } else {
             crate::filter::ProxyFilter::new(&config.allowed_hosts)
         }
-        .with_denied_hosts(&config.denied_hosts);
+        .with_denied_hosts(&config.denied_hosts)
+        .with_ssh_endpoints(&config.ssh_endpoints);
         // Hostname-only reachability: pass no resolved IPs so the link-local
         // SSRF check is skipped (that is a runtime DNS concern, not a config
         // one) and only the deny-list / allowlist hostname rules apply.
@@ -1173,7 +1174,8 @@ pub async fn start_with_nonce_resolver(
     } else {
         ProxyFilter::new(&config.allowed_hosts)
     }
-    .with_denied_hosts(&config.denied_hosts);
+    .with_denied_hosts(&config.denied_hosts)
+    .with_ssh_endpoints(&config.ssh_endpoints);
 
     // Build bypass matcher from external proxy config (once, not per-request)
     let bypass_matcher = config

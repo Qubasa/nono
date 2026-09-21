@@ -13,6 +13,7 @@ struct WhyContext {
     overridden_paths: Vec<std::path::PathBuf>,
     allowed_domains: Vec<String>,
     denied_domains: Vec<String>,
+    ssh_endpoints: Vec<String>,
     domain_endpoints: Vec<sandbox_state::DomainEndpointState>,
     command_policies: Option<CommandPoliciesConfig>,
 }
@@ -50,11 +51,6 @@ fn resolve_allowed_domains(profile: &profile::Profile) -> Result<Vec<String>> {
         &net_policy,
         &plain_entries,
     ));
-    // Port-exact: appended as `host:port` without `expand_proxy_allow`, which
-    // would strip the port and answer "allowed" for every port on that host.
-    domains.extend(network_policy::ssh_allowlist_entries(
-        &profile.network.allow_ssh,
-    )?);
 
     Ok(domains)
 }
@@ -69,19 +65,31 @@ fn resolve_denied_domains(profile: &profile::Profile) -> Result<Vec<String>> {
     ))
 }
 
+/// Resolve the port-exact SSH endpoints from a profile plus `--allow-ssh`.
+fn resolve_ssh_endpoints(profile: &profile::Profile, cli_entries: &[String]) -> Result<Vec<String>> {
+    let mut entries = profile.network.allow_ssh.clone();
+    entries.extend(cli_entries.iter().cloned());
+    network_policy::ssh_allowlist_entries(&entries)
+}
+
 /// Merge `--allow-domain` overrides into a resolved allowlist.
+///
+/// `ssh_endpoints` join it only when it is already filtering, mirroring
+/// `build_proxy_config_from_flags`: on an open policy the endpoints are pins
+/// alone, and writing them here would report SSH as the only reachable host.
 fn merge_cli_allow_domains(
     mut domains: Vec<String>,
     cli_entries: &[String],
-    cli_ssh_entries: &[String],
+    ssh_endpoints: &[String],
 ) -> Result<Vec<String>> {
-    domains.extend(network_policy::ssh_allowlist_entries(cli_ssh_entries)?);
-    if cli_entries.is_empty() {
-        return Ok(domains);
+    if !cli_entries.is_empty() {
+        let policy_json = crate::config::embedded::embedded_network_policy_json();
+        let net_policy = network_policy::load_network_policy(policy_json)?;
+        domains.extend(network_policy::expand_proxy_allow(&net_policy, cli_entries));
     }
-    let policy_json = crate::config::embedded::embedded_network_policy_json();
-    let net_policy = network_policy::load_network_policy(policy_json)?;
-    domains.extend(network_policy::expand_proxy_allow(&net_policy, cli_entries));
+    if !domains.is_empty() {
+        domains.extend(ssh_endpoints.iter().cloned());
+    }
     Ok(domains)
 }
 
@@ -158,6 +166,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
                     overridden_paths: paths,
                     allowed_domains: state.allowed_domains.clone(),
                     denied_domains: state.denied_domains.clone(),
+                    ssh_endpoints: state.ssh_endpoints.clone(),
                     domain_endpoints,
                     command_policies: None,
                 }
@@ -209,10 +218,11 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             }
         }
 
+        let ssh_endpoints = resolve_ssh_endpoints(&profile, &args.allow_ssh)?;
         let allowed_domains = merge_cli_allow_domains(
             resolve_allowed_domains(&profile)?,
             &args.allow_proxy,
-            &args.allow_ssh,
+            &ssh_endpoints,
         )?;
         let denied_domains =
             merge_cli_deny_domains(resolve_denied_domains(&profile)?, &args.deny_proxy)?;
@@ -230,6 +240,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             overridden_paths: override_paths,
             allowed_domains,
             denied_domains,
+            ssh_endpoints,
             domain_endpoints,
             command_policies,
         }
@@ -258,9 +269,10 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             allowed_domains: merge_cli_allow_domains(
                 Vec::new(),
                 &args.allow_proxy,
-                &args.allow_ssh,
+                &[],
             )?,
             denied_domains: merge_cli_deny_domains(Vec::new(), &args.deny_proxy)?,
+            ssh_endpoints: network_policy::ssh_allowlist_entries(&args.allow_ssh)?,
             domain_endpoints: vec![],
             command_policies: None,
         }
@@ -307,9 +319,12 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             host,
             args.port,
             &ctx.caps,
-            &ctx.allowed_domains,
-            &ctx.denied_domains,
-            &ctx.domain_endpoints,
+            query_ext::NetworkPolicyView {
+                allowed_domains: &ctx.allowed_domains,
+                denied_domains: &ctx.denied_domains,
+                ssh_endpoints: &ctx.ssh_endpoints,
+                domain_endpoints: &ctx.domain_endpoints,
+            },
         )
     } else if let Some(ref scope) = args.scope {
         query_scope(scope_query(scope), &ctx.caps)
@@ -731,18 +746,32 @@ mod tests {
 
     /// Query a host against a profile the same way `run_why --profile` does.
     fn why_profile_host(json: &str, host: &str) -> query_ext::QueryResult {
+        why_profile_endpoint(json, host, 443)
+    }
+
+    fn why_profile_endpoint(json: &str, host: &str, port: u16) -> query_ext::QueryResult {
         let profile = profile_from_json(json);
         let mut caps = CapabilitySet::new();
         if profile.network.block {
             caps.set_network_blocked(true);
         }
+        let ssh_endpoints = resolve_ssh_endpoints(&profile, &[]).expect("resolve ssh endpoints");
+        let allowed = merge_cli_allow_domains(
+            resolve_allowed_domains(&profile).expect("resolve allowlist"),
+            &[],
+            &ssh_endpoints,
+        )
+        .expect("merge allowlist");
         query_ext::query_network(
             host,
-            443,
+            port,
             &caps,
-            &resolve_allowed_domains(&profile).expect("resolve allowlist"),
-            &resolve_denied_domains(&profile).expect("resolve denylist"),
-            &resolve_domain_endpoints(&profile),
+            query_ext::NetworkPolicyView {
+                allowed_domains: &allowed,
+                denied_domains: &resolve_denied_domains(&profile).expect("resolve denylist"),
+                ssh_endpoints: &ssh_endpoints,
+                domain_endpoints: &resolve_domain_endpoints(&profile),
+            },
         )
     }
 
@@ -863,6 +892,51 @@ mod tests {
         assert_eq!(
             reason_of(&why_profile_host(config, "anything-else.example.com")),
             "proxy_allowed"
+        );
+    }
+
+    /// `why` must answer what the proxy enforces: on an open policy the SSH
+    /// port is closed everywhere but the pinned host, and nothing else moves.
+    #[test]
+    fn profile_allow_ssh_pins_its_port_on_an_open_policy() {
+        let config = r#"{"network":{"allow_ssh":["build.example.com"]}}"#;
+        assert!(
+            matches!(
+                why_profile_endpoint(config, "build.example.com", 22),
+                query_ext::QueryResult::Allowed { .. }
+            ),
+            "the pinned endpoint must stay reachable"
+        );
+        assert_eq!(
+            reason_of(&why_profile_endpoint(config, "other.example.com", 22)),
+            "ssh_port_pinned"
+        );
+        assert!(
+            matches!(
+                why_profile_endpoint(config, "other.example.com", 443),
+                query_ext::QueryResult::Allowed { .. }
+            ),
+            "an open policy must stay open on every port the pin does not name"
+        );
+    }
+
+    /// An allowlist that is already filtering keeps its own refusals, and the
+    /// SSH host reaches only its own port.
+    #[test]
+    fn profile_allow_ssh_beside_allow_domain_stays_port_exact() {
+        let config =
+            r#"{"network":{"allow_domain":["api.example.com"],"allow_ssh":["build.example.com"]}}"#;
+        assert_eq!(
+            reason_of(&why_profile_endpoint(config, "build.example.com", 22)),
+            "proxy_allowed"
+        );
+        assert_eq!(
+            reason_of(&why_profile_endpoint(config, "build.example.com", 443)),
+            "port_not_allowed"
+        );
+        assert_eq!(
+            reason_of(&why_profile_endpoint(config, "evil.example.com", 443)),
+            "proxy_filtered"
         );
     }
 
