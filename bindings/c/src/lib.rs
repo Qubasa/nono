@@ -134,7 +134,9 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
             NonoErrorCode::ErrInvalidArg
         }
         nono::NonoError::VersionDowngrade { .. } => NonoErrorCode::ErrConfigParse,
-        nono::NonoError::Io(_) | nono::NonoError::CommandExecution(_) => NonoErrorCode::ErrIo,
+        nono::NonoError::Io(_)
+        | nono::NonoError::CommandExecution(_)
+        | nono::NonoError::SshTunnel(_) => NonoErrorCode::ErrIo,
         nono::NonoError::ObjectStore(_)
         | nono::NonoError::Snapshot(_)
         | nono::NonoError::AuditLedgerCorrupt { .. }
