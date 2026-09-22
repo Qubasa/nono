@@ -72,9 +72,10 @@ brew install nono
 
 #### Nix
 
-The project provides a Nix flake with two outputs:
+The project provides a Nix flake with three outputs:
 
-- `#default` (from source) — builds from source using `buildRustPackage` (first run compiles the crate and its dependencies)
+- `#default` (from source) — builds from source with [crane](https://github.com/ipetkov/crane); dependencies compile once into a separate `nono-deps` derivation, so later source changes only rebuild the workspace crates
+- `#deps` — the dependency-only derivation on its own, for warming a binary cache
 - `#prebuilt` — fetches the official release binary from GitHub Releases (fast, no compilation)
 
 ```bash

@@ -7,9 +7,12 @@
     # compatibility. The project requires Rust 1.95 (edition2024), which
     # nixpkgs-unstable does not reliably ship for x86_64-darwin.
     nixpkgs-darwin-legacy.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
+    # Splits the cargo build into a cached dependency derivation and the
+    # workspace build. crane has no flake inputs of its own.
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, nixpkgs-darwin-legacy, ... }:
+  outputs = { self, nixpkgs, nixpkgs-darwin-legacy, crane, ... }:
   let
     # Read version from Cargo.toml so it never needs manual syncing
     cargoToml = builtins.fromTOML (builtins.readFile ./crates/nono-cli/Cargo.toml);
@@ -23,28 +26,55 @@
       then nixpkgs-darwin-legacy.legacyPackages.${system}
       else nixpkgs.legacyPackages.${system};
 
-    nonoFor = system: let pkgs = pkgsFor system; in pkgs.rustPlatform.buildRustPackage {
-      pname = "nono";
-      inherit version;
-      src = self;
+    # Two derivations so a source edit never recompiles third-party crates:
+    # nono-deps builds every dependency from a dummy tree crane derives from
+    # Cargo.lock and the manifests alone (read at evaluation time, with the
+    # store context stripped, so its path only moves when dependencies do),
+    # and nono reuses that target/ directory.
+    craneFor = system:
+      let
+        pkgs = pkgsFor system;
+        craneLib = crane.mkLib pkgs;
 
-      cargoLock.lockFile = "${self}/Cargo.lock";
+        commonArgs = {
+          pname = "nono";
+          inherit version;
 
-      nativeBuildInputs = [ pkgs.pkg-config ];
-      buildInputs = [ pkgs.dbus ];
+          # The whole tree, not a cargo-only source filter: the build scripts
+          # read crates/nono-cli/data/ and crates/nono/schema/, and without
+          # them nono-cli/build.rs takes its "not found" branch and emits
+          # POLICY_JSON_EMBEDDED=0 instead of failing.
+          src = self;
+          strictDeps = true;
 
-      # Tests require /bin/pwd, /usr/bin/env, git, /var/folders, network, etc.
-      # and fail in the Nix sandbox. The project's own CI covers testing.
-      doCheck = false;
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.dbus ];
 
-      meta = with pkgs.lib; {
-        description = "Secure, kernel-enforced sandbox for AI agents, MCP and LLM workloads";
-        homepage = "https://github.com/nolabs-ai/nono";
-        license = licenses.asl20;
-        mainProgram = "nono";
-        platforms = allSystems;
+          # Tests require /bin/pwd, /usr/bin/env, git, /var/folders, network, etc.
+          # and fail in the Nix sandbox. The project's own CI covers testing.
+          doCheck = false;
+        };
+
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+      in
+      {
+        deps = cargoArtifacts;
+
+        nono = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+
+          meta = with pkgs.lib; {
+            description = "Secure, kernel-enforced sandbox for AI agents, MCP and LLM workloads";
+            homepage = "https://github.com/nolabs-ai/nono";
+            license = licenses.asl20;
+            mainProgram = "nono";
+            platforms = allSystems;
+          };
+        });
       };
-    };
+
+    # Evaluated once per system and shared by packages/apps/checks.
+    built = forAllSystems craneFor;
 
     # Map Nix system triples to the release tarball target strings.
     releaseTarget = system: {
@@ -102,21 +132,24 @@
       };
     };
   in {
-    packages = forAllSystems (system: rec {
-      nono = nonoFor system;
+    packages = forAllSystems (system: {
+      inherit (built.${system}) nono;
+      # Dependency-only build. `nix build .#deps` (and pushing it to a binary
+      # cache) warms the cache every later `nix build .#nono` reuses.
+      deps = built.${system}.deps;
       prebuilt = prebuiltFor system;
-      default = nono;
+      default = built.${system}.nono;
     });
 
     apps = forAllSystems (system: {
       default = {
         type = "app";
-        program = "${nonoFor system}/bin/nono";
+        program = "${built.${system}.nono}/bin/nono";
       };
     });
 
     checks = forAllSystems (system: {
-      default = nonoFor system;
+      default = built.${system}.nono;
     });
 
     devShells = forAllSystems (system: let pkgs = pkgsFor system; in {
