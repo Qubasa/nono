@@ -215,7 +215,7 @@ A refusal arrives as a failed channel request, not as a broken connection, so a 
 
 Two layers can refuse the same flag, and which one speaks first depends on the flag. `ssh -L` usually never reaches the bastion at all: binding the local listener is itself a sandboxed operation, and Landlock's `AccessNet::BindTcp` restriction refuses it with `bind: Permission denied` before any channel is opened. The seccomp destination pin is a different control, and governs `connect`/`sendto` rather than `bind`. `ssh -J` reaches the `direct-tcpip` rule and is refused there. Either way the answer is no, and only the wording differs.
 
-`sftp`, `scp` and `rsync -e ssh` keep working, because each one is a subsystem or a remote command inside a session channel.
+`sftp`, `scp` and `rsync` keep working, because each one is a subsystem or a remote command inside a session channel. Each is also wired to the generated config below; without that they reach the mediation only by accident.
 
 #### Per-Endpoint Command Allowlist
 
@@ -259,9 +259,12 @@ Host *
 `nono ssh-relay` is a hidden helper subcommand that exists for this `ProxyCommand`; it is not a user-facing command. It connects to the session's unix socket and copies stdio both ways, and that is all it does: it holds no policy and no credential, because the SSH session it carries terminates at nono in the parent process, outside the sandbox. Two environment tweaks point clients at the generated config:
 
 - `GIT_SSH_COMMAND="ssh -F <config>"`, so `git clone ssh://…` works unmodified.
-- A directory containing a generated `ssh` wrapper is prepended to the child's `PATH`, so an `ssh` that the sandboxed process resolves itself — from a shell, a build script, a `Makefile` — picks the config up too. It is not installed under Tool Sandbox, where the shim directory owns `ssh` on `PATH`.
+- `RSYNC_RSH="ssh -F <config>"`, so `rsync host:path .` works unmodified. rsync has no config flag of its own.
+- A directory containing generated `ssh`, `scp` and `sftp` wrappers is prepended to the child's `PATH`, so a tool the sandboxed process resolves itself — from a shell, a build script, a `Makefile` — picks the config up too. It is not installed under Tool Sandbox, where the shim directory owns `ssh` on `PATH`.
 
-Both are removed when the session ends.
+Wrapping every one of them is load-bearing rather than tidy. `-F` is what makes OpenSSH skip `/etc/ssh/ssh_config`, and on a NixOS host that file `Include`s paths in the Nix store, which inside the sandbox's user namespace report as `nobody:nogroup`. OpenSSH rejects a config it considers wrongly owned, so an unwrapped `scp` dies with `Bad owner or permissions` before it ever reaches the mediation.
+
+All of it is removed when the session ends.
 
 <Note>
   The generated config and the PATH wrapper are ergonomics, not enforcement. Invoking `/usr/bin/ssh` by absolute path skips both and fails closed with `EACCES` - bypassing the wrapper never widens access. Two things enforce: the kernel destination pin, a seccomp user-notification filter that restricts `connect`/`sendto` to the proxy address, and the mediation itself, which authorizes each channel request after the client's session has already terminated at nono.
@@ -285,7 +288,7 @@ Each of these is refused before the sandbox starts:
 | `--allow-net` with `--allow-ssh` | `--allow-net` bypasses the proxy entirely, so the destination pin could not apply. |
 | A host in both `allow_ssh` and `network.no_proxy` | `no_proxy` tells clients to go direct for that host, and there is no direct route: the endpoint is reachable only through the mediated session. |
 | Any configuration where the seccomp-notify supervisor is not installed | The supervisor is the destination pin. This covers `linux.sandbox_policy` of `landlock` or `external`, and WSL2, where seccomp notify returns `EBUSY`. Landlock filters by port only, so the "just this endpoint" allowance could not be kernel-enforced. |
-| `command_policies.commands` (Tool Sandbox) with `allow_ssh` | A tool-sandboxed child does not inherit nono's environment namespace, so `NONO_SSH_BASTION` is stripped and `GIT_SSH_COMMAND` is not on the allowed list. The child would have no route to the mediation and every SSH session in it would fail, so nono refuses the combination rather than starting with a broken SSH route. |
+| `command_policies.commands` (Tool Sandbox) with `allow_ssh` | A tool-sandboxed child does not inherit nono's environment namespace, so `NONO_SSH_BASTION` is stripped, and neither `GIT_SSH_COMMAND` nor `RSYNC_RSH` is on the allowed list. The child would have no route to the mediation and every SSH session in it would fail, so nono refuses the combination rather than starting with a broken SSH route. |
 
 The refusal is keyed off whether the pin will actually be installed, not off a list of policy names, so `allow_ssh` on WSL2 is rejected outright rather than degrading through `security.wsl2_proxy_policy`. See [Credential Proxy on WSL2](/cli/internals/wsl2#credential-proxy-on-wsl2).
 

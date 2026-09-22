@@ -1647,11 +1647,12 @@ pub(crate) fn prepare_proxy_launch_options(
     Ok(NetworkIntent::ProxyFiltered(Box::new(opts)))
 }
 
-/// `network.allow_ssh` reaches the sandboxed child as `NONO_SSH_BASTION` and
-/// `GIT_SSH_COMMAND`, and a tool-sandboxed child receives neither:
-/// `filter_child_env` in tool-sandbox/platform/linux.rs strips every `NONO_`
-/// variable, and `DEFAULT_ENV_ALLOW` in tool-sandbox/env.rs does not carry
-/// `GIT_SSH_COMMAND`. Those two are what would have to change to lift this.
+/// `network.allow_ssh` reaches the sandboxed child as `NONO_SSH_BASTION`,
+/// `GIT_SSH_COMMAND` and `RSYNC_RSH`, and a tool-sandboxed child receives
+/// none of them: `filter_child_env` in tool-sandbox/platform/linux.rs strips
+/// every `NONO_` variable, and `DEFAULT_ENV_ALLOW` in tool-sandbox/env.rs
+/// carries neither of the other two. Those are what would have to change to
+/// lift this.
 fn reject_ssh_with_command_policies(opts: &ProxyLaunchOptions) -> Result<()> {
     let has_ssh = opts
         .domain_filter
@@ -3235,6 +3236,10 @@ pub(crate) fn start_proxy_runtime(
             bastion.socket_path().display().to_string(),
         ));
         env_vars.push(("GIT_SSH_COMMAND".to_string(), files.git_ssh_command()));
+        // rsync resolves `ssh` through PATH, where the wrapper already sits,
+        // but a build configured with a different default remote shell would
+        // miss it. Naming it explicitly costs nothing and closes that gap.
+        env_vars.push(("RSYNC_RSH".to_string(), files.rsync_rsh()));
         (Some(files), Some(bastion))
     };
 
@@ -3344,7 +3349,12 @@ fn grant_ssh_client_access(
     nono_exe: &std::path::Path,
 ) -> Result<()> {
     let mut readable = vec![files.config_path(), files.known_hosts_path(), nono_exe];
-    readable.extend(files.wrapper_path());
+    readable.extend(
+        files
+            .wrapper_paths()
+            .iter()
+            .map(std::path::PathBuf::as_path),
+    );
     for path in readable {
         #[cfg(target_os = "macos")]
         {
@@ -3369,12 +3379,17 @@ fn grant_ssh_client_access(
         );
     }
 
-    // The wrapper is a `#!/bin/sh` script, so its grant has to cover
+    // Each wrapper is a `#!/bin/sh` script, so its grant has to cover
     // `process-exec-interpreter` too, which only the starred form does.
     #[cfg(target_os = "macos")]
     {
         let mut executable = vec![nono_exe];
-        executable.extend(files.wrapper_path());
+        executable.extend(
+            files
+                .wrapper_paths()
+                .iter()
+                .map(std::path::PathBuf::as_path),
+        );
         for path in executable {
             let escaped = seatbelt_literal(path)?;
             caps.add_platform_rule(format!("(allow process-exec* (literal \"{escaped}\"))"))?;

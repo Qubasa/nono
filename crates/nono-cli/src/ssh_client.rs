@@ -2,9 +2,15 @@
 //!
 //! `ssh` has no environment variable for `ProxyCommand`, so the setting has to
 //! reach it as a file. This module materialises a session-scoped config that
-//! routes every SSH target through `nono ssh-relay`, plus an `ssh` wrapper
-//! that gets prepended to the child's `PATH` so a bare `ssh` picks the config
-//! up too.
+//! routes every SSH target through `nono ssh-relay`, plus wrappers for every
+//! tool that speaks SSH, prepended to the child's `PATH` so a bare `ssh`,
+//! `scp` or `sftp` picks the config up too.
+//!
+//! `-F` is what makes the wrapper load-bearing rather than cosmetic: it makes
+//! OpenSSH skip `/etc/ssh/ssh_config` entirely. On NixOS that file `Include`s
+//! paths in the Nix store, which inside the sandbox's user namespace report as
+//! `nobody:nogroup`, and OpenSSH rejects a config it considers wrongly owned.
+//! `ssh` survived that only because it was the one tool being wrapped.
 //!
 //! Both are **ergonomics, not enforcement**. Invoking `/usr/bin/ssh` by
 //! absolute path skips them and fails closed with `EACCES`, because the
@@ -19,7 +25,14 @@
 use nono::{NonoError, Result};
 use std::path::{Path, PathBuf};
 
-/// Session-scoped generated SSH config and `ssh` wrapper.
+/// Names of the tools wrapped on the child's `PATH`.
+///
+/// Each takes `-F` with the same meaning. `rsync` is deliberately absent: it
+/// has no config flag of its own and finds its remote shell through `PATH` or
+/// `RSYNC_RSH`, both of which the wrapper already covers.
+const WRAPPED_TOOLS: [&str; 3] = ["ssh", "scp", "sftp"];
+
+/// Session-scoped generated SSH config and the `ssh`/`scp`/`sftp` wrappers.
 ///
 /// Dropping removes the whole directory, mirroring how the TLS-intercept
 /// trust bundle is torn down.
@@ -27,7 +40,7 @@ pub(crate) struct SshClientFiles {
     root: PathBuf,
     config_path: PathBuf,
     bin_dir: PathBuf,
-    wrapper_path: Option<PathBuf>,
+    wrapper_paths: Vec<PathBuf>,
     known_hosts_path: PathBuf,
     socket_path: PathBuf,
     host_key: russh::keys::PrivateKey,
@@ -45,17 +58,32 @@ impl SshClientFiles {
         &self.known_hosts_path
     }
 
-    /// Directory to prepend to the child's `PATH`, when a wrapper was created.
+    /// Directory to prepend to the child's `PATH`, when wrappers were created.
     pub(crate) fn bin_dir(&self) -> Option<&Path> {
-        self.wrapper_path.as_ref().map(|_| self.bin_dir.as_path())
+        if self.wrapper_paths.is_empty() {
+            None
+        } else {
+            Some(self.bin_dir.as_path())
+        }
     }
 
-    pub(crate) fn wrapper_path(&self) -> Option<&Path> {
-        self.wrapper_path.as_deref()
+    /// Every generated wrapper, for the read and execute grants.
+    pub(crate) fn wrapper_paths(&self) -> &[PathBuf] {
+        &self.wrapper_paths
     }
 
     /// `GIT_SSH_COMMAND` value pointing git's SSH at the generated config.
     pub(crate) fn git_ssh_command(&self) -> String {
+        self.ssh_command()
+    }
+
+    /// `RSYNC_RSH` value, so rsync routes through the mediation even when it
+    /// resolves its remote shell without consulting `PATH`.
+    pub(crate) fn rsync_rsh(&self) -> String {
+        self.ssh_command()
+    }
+
+    fn ssh_command(&self) -> String {
         format!(
             "ssh -F {}",
             shell_quote(&self.config_path.to_string_lossy())
@@ -148,27 +176,33 @@ pub(crate) fn prepare_ssh_client_files(nono_exe: &Path) -> Result<SshClientFiles
     );
     write_new(&config_path, config.as_bytes(), 0o400)?;
 
-    let wrapper_path = match resolve_real_ssh() {
-        Some(real_ssh) => {
+    // One wrapper per tool that understands `-F`. A tool missing from the
+    // host gets no wrapper rather than a broken one, and `ssh` missing means
+    // no wrappers are useful at all: the others all exec it.
+    let mut wrapper_paths = Vec::new();
+    if resolve_on_path("ssh").is_some() {
+        for tool in WRAPPED_TOOLS {
+            let Some(real) = resolve_on_path(tool) else {
+                continue;
+            };
             let script = format!(
                 "#!/bin/sh\nexec {} -F {} \"$@\"\n",
-                shell_quote(&real_ssh.to_string_lossy()),
+                shell_quote(&real.to_string_lossy()),
                 shell_quote(&config_path.to_string_lossy())
             );
-            let path = bin_dir.join("ssh");
+            let path = bin_dir.join(tool);
             write_new(&path, script.as_bytes(), 0o500)?;
-            set_dir_mode(&bin_dir, 0o500)?;
-            Some(path)
+            wrapper_paths.push(path);
         }
-        None => None,
-    };
+        set_dir_mode(&bin_dir, 0o500)?;
+    }
 
     cleanup.disarm();
     Ok(SshClientFiles {
         root,
         config_path,
         bin_dir,
-        wrapper_path,
+        wrapper_paths,
         known_hosts_path,
         socket_path,
         host_key,
@@ -201,12 +235,12 @@ impl Drop for DirGuard {
     }
 }
 
-/// First `ssh` on the host `PATH`. Resolved here, before the wrapper dir is
-/// prepended, so the wrapper cannot exec itself.
-fn resolve_real_ssh() -> Option<PathBuf> {
+/// First `name` on the host `PATH`. Resolved here, before the wrapper dir is
+/// prepended, so a wrapper cannot exec itself.
+fn resolve_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|dir| dir.join("ssh"))
+        .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
 }
 
@@ -335,6 +369,36 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o400);
         }
+    }
+
+    /// `ssh` alone being wrapped is what made `scp`, `sftp` and `rsync` fail
+    /// on any host whose system `ssh_config` the sandbox cannot read. Each
+    /// wrapper has to carry `-F`, which is what makes OpenSSH skip that file.
+    #[test]
+    fn every_ssh_speaking_tool_is_wrapped_onto_the_generated_config() {
+        let (_dir, _env, _lock) = isolated_state();
+        let exe = PathBuf::from("/opt/nono/bin/nono");
+        let files = prepare_ssh_client_files(&exe).expect("prepare ssh client files");
+
+        let bin_dir = files
+            .bin_dir()
+            .expect("a wrapper dir on a host carrying ssh");
+        for tool in WRAPPED_TOOLS {
+            let wrapper = bin_dir.join(tool);
+            let script = std::fs::read_to_string(&wrapper)
+                .unwrap_or_else(|e| panic!("read the {tool} wrapper: {e}"));
+            assert!(
+                script.contains(&format!("-F '{}'", files.config_path().display())),
+                "the {tool} wrapper must name the generated config: {script}"
+            );
+            assert!(
+                files.wrapper_paths().contains(&wrapper),
+                "the {tool} wrapper must be granted to the sandbox"
+            );
+        }
+
+        // rsync takes no config flag; the env var is its only route.
+        assert_eq!(files.rsync_rsh(), files.git_ssh_command());
     }
 
     /// The client must verify nono, and only nono: a key captured from one
