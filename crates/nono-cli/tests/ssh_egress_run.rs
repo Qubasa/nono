@@ -18,6 +18,7 @@ use nono_test_support::{Argv, NonoTest, RunMode, Sandboxed, nono_test};
 use std::fs;
 use std::io::Write;
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -73,8 +74,23 @@ fn which(name: &str) -> Option<PathBuf> {
         .and_then(|cand| fs::canonicalize(cand).ok())
 }
 
-/// A free loopback port. Racy by construction, which is why every fixture that
-/// uses one also waits for the thing it started to actually accept.
+/// Record a missing prerequisite and let the caller return.
+///
+/// `NONO_TEST_REQUIRE_SSHD` turns every one of these into a failure. Without
+/// it an image carrying no sshd package reports green for the entire subject
+/// of this file.
+fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("NONO_TEST_REQUIRE_SSHD").is_none(),
+        "NONO_TEST_REQUIRE_SSHD is set, so a missing prerequisite is a failure: {reason}"
+    );
+    eprintln!("skipping: {reason}");
+}
+
+/// A free loopback port. The listener is dropped before the caller binds, so
+/// the port is only a suggestion: `spawn_sshd` waits for sshd's own pid file
+/// rather than for the port to answer, because a sibling test winning the race
+/// would make the port answer without sshd being there at all.
 fn free_port() -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
     listener.local_addr().expect("listener addr").port()
@@ -115,33 +131,164 @@ impl Drop for ShortState {
     }
 }
 
+/// A short unix-socket path under `/tmp`, unique per call.
+///
+/// `SUN_LEN` is 108 bytes, and the harness's tempdir under
+/// `crates/nono-cli/target/test-artifacts/` does not leave room for one.
+fn short_socket_path(kind: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PathBuf::from(format!(
+        "/tmp/nono-{kind}-{}-{seq}.sock",
+        std::process::id()
+    ))
+}
+
+/// A listening `AF_UNIX` socket that exists only to be something the sandbox
+/// can try to connect to and fail.
+///
+/// Reading "unreachable" off a variable nobody set proves nothing: the probe
+/// needs a socket that is genuinely there and genuinely out of reach.
+struct DecoySocket {
+    path: PathBuf,
+    _listener: UnixListener,
+}
+
+impl DecoySocket {
+    fn bind(kind: &str) -> Self {
+        let path = short_socket_path(kind);
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("a fresh name under /tmp");
+        Self {
+            path,
+            _listener: listener,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for DecoySocket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A real `ssh-agent`, optionally holding the fixture's client key.
+///
+/// With a key it is the default credential path, the one a user gets without
+/// passing `--ssh-key`. Empty it is still useful: OpenSSH sends
+/// `auth-agent-req@openssh.com` only when it has an agent to forward, so
+/// without one `ssh -A` asks for nothing and a test of the refusal has nothing
+/// to observe.
+struct Agent {
+    path: PathBuf,
+    child: Child,
+}
+
+impl Agent {
+    fn start(key: Option<&Path>) -> Option<Self> {
+        let Some(agent) = which("ssh-agent") else {
+            skip("no ssh-agent on PATH");
+            return None;
+        };
+
+        let path = short_socket_path("agent");
+        let _ = fs::remove_file(&path);
+        let child = Command::new(agent)
+            .arg("-D")
+            .arg("-a")
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ssh-agent was just resolved on PATH");
+        let server = Self { path, child };
+        assert!(
+            server.wait_for_socket(),
+            "ssh-agent never bound {}",
+            server.path.display()
+        );
+
+        let Some(key) = key else { return Some(server) };
+        let Some(add) = which("ssh-add") else {
+            skip("ssh-agent is installed but ssh-add is not");
+            return None;
+        };
+        let status = Command::new(add)
+            .arg(key)
+            .env("SSH_AUTH_SOCK", &server.path)
+            .env_remove("DISPLAY")
+            .env_remove("SSH_ASKPASS")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("ssh-add was just resolved on PATH");
+        assert!(status.success(), "ssh-add could not load the fixture key");
+        Some(server)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn wait_for_socket(&self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        false
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// A real `sshd` on loopback, with generated host and client keys.
 struct Sshd {
     port: u16,
     user: String,
+    dir: PathBuf,
+    keygen: PathBuf,
     client_key: PathBuf,
-    log: PathBuf,
     child: Child,
 }
 
 impl Sshd {
-    /// Start `sshd`, or explain why the caller must skip.
+    /// Start `sshd` and record its host key in `<home>/.ssh/known_hosts`.
     ///
-    /// Also writes `<home>/.ssh/known_hosts` for the generated host key, which
-    /// is what the bastion's outbound leg verifies against: it reads the user's
-    /// own `known_hosts` and never trusts on first use, so without this entry
-    /// the parent refuses to connect at all.
+    /// That file is what the bastion's outbound leg verifies against: it reads
+    /// the user's own `known_hosts` and never trusts on first use, so without
+    /// the entry the parent refuses to connect at all.
     fn start(t: &NonoTest) -> Option<Self> {
+        let server = Self::start_untrusted(t)?;
+        server.trust_host_key(t);
+        Some(server)
+    }
+
+    /// The same server with nothing recorded in `known_hosts`, for the tests
+    /// about a host the outbound leg has never seen.
+    fn start_untrusted(t: &NonoTest) -> Option<Self> {
         let Some(sshd) = sshd_bin() else {
-            eprintln!("skipping: no sshd found on PATH, /usr/sbin or /run/current-system/sw/bin");
+            skip("no sshd found on PATH, /usr/sbin or /run/current-system/sw/bin");
             return None;
         };
         let Some(keygen) = which("ssh-keygen") else {
-            eprintln!("skipping: sshd is installed but ssh-keygen is not");
+            skip("sshd is installed but ssh-keygen is not");
             return None;
         };
         let Some(user) = remote_user() else {
-            eprintln!("skipping: neither USER nor LOGNAME is set, so no account to log in as");
+            skip("neither USER nor LOGNAME is set, so no account to log in as");
             return None;
         };
 
@@ -149,84 +296,45 @@ impl Sshd {
         fs::create_dir_all(&dir).expect("test root is a fresh dir this test owns");
         let host_key = dir.join("host_key");
         let client_key = dir.join("client_key");
-        for key in [&host_key, &client_key] {
-            let status = Command::new(&keygen)
-                .args(["-q", "-t", "ed25519", "-N", "", "-C", "nono-test", "-f"])
-                .arg(key)
-                .status()
-                .expect("ssh-keygen was just resolved on PATH");
-            assert!(status.success(), "ssh-keygen failed for {}", key.display());
-        }
+        generate_key(&keygen, &host_key);
+        generate_key(&keygen, &client_key);
 
-        let port = free_port();
-        let config = dir.join("sshd_config");
-        // `StrictModes no` because the keys live under `target/`, and `UsePAM
-        // no` because this sshd runs as an ordinary user. Forwarding is left
-        // enabled on the server so that a refused forward is provably nono's
-        // decision and not the remote's.
-        fs::write(
-            &config,
-            format!(
-                "Port {port}\n\
-                 ListenAddress 127.0.0.1\n\
-                 HostKey {host_key}\n\
-                 PidFile {pid}\n\
-                 StrictModes no\n\
-                 UsePAM no\n\
-                 PermitUserEnvironment no\n\
-                 AuthorizedKeysFile {authorized}\n\
-                 PubkeyAuthentication yes\n\
-                 PasswordAuthentication no\n\
-                 KbdInteractiveAuthentication no\n\
-                 AllowTcpForwarding yes\n\
-                 AllowAgentForwarding yes\n\
-                 PrintMotd no\n\
-                 LogLevel VERBOSE\n",
-                host_key = host_key.display(),
-                pid = dir.join("sshd.pid").display(),
-                authorized = dir.join("client_key.pub").display(),
-            ),
-        )
-        .expect("sshd dir is a fresh dir this test owns");
-
-        let log = dir.join("sshd.log");
-        let out = fs::File::create(&log).expect("sshd dir is a fresh dir this test owns");
-        let err = out.try_clone().expect("a just-created file clones");
-        let child = Command::new(&sshd)
-            .arg("-D")
-            .arg("-f")
-            .arg(&config)
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
-            .spawn()
-            .expect("sshd was just resolved to an existing file");
-
-        let server = Self {
+        let (child, port) = spawn_sshd(&sshd, &dir, &host_key);
+        Some(Self {
             port,
             user,
+            dir,
+            keygen,
             client_key,
-            log,
             child,
-        };
-        if !wait_for_port(port) {
-            eprintln!(
-                "skipping: sshd did not start on 127.0.0.1:{port}; its log said:\n{}",
-                fs::read_to_string(&server.log).unwrap_or_default()
-            );
-            return None;
-        }
+        })
+    }
 
-        let host_pub =
-            fs::read_to_string(dir.join("host_key.pub")).expect("ssh-keygen wrote the public key");
+    /// Record this server's real host key for its endpoint.
+    fn trust_host_key(&self, t: &NonoTest) {
+        let pub_key = fs::read_to_string(self.dir.join("host_key.pub"))
+            .expect("ssh-keygen wrote the public key");
+        self.write_known_hosts(t, &pub_key);
+    }
+
+    /// Record a different key for this endpoint, which is what a client holds
+    /// once the host it trusted has been replaced.
+    fn trust_a_different_host_key(&self, t: &NonoTest) {
+        let other = self.dir.join("other_host_key");
+        generate_key(&self.keygen, &other);
+        let pub_key = fs::read_to_string(self.dir.join("other_host_key.pub"))
+            .expect("ssh-keygen wrote the public key");
+        self.write_known_hosts(t, &pub_key);
+    }
+
+    fn write_known_hosts(&self, t: &NonoTest, pub_key: &str) {
         let ssh_home = t.home().join(".ssh");
         fs::create_dir_all(&ssh_home).expect("home is a fresh dir this test owns");
         fs::write(
-            ssh_home.join("known_hosts"),
-            format!("[127.0.0.1]:{port} {}\n", host_pub.trim()),
+            known_hosts_path(t),
+            format!("[127.0.0.1]:{} {}\n", self.port, pub_key.trim()),
         )
         .expect("home is a fresh dir this test owns");
-
-        Some(server)
     }
 
     /// The endpoint as an allowance names it: the remote identity is nono's
@@ -235,7 +343,10 @@ impl Sshd {
         format!("{}@127.0.0.1:{}", self.user, self.port)
     }
 
-    /// What the sandboxed client types, which carries no user at all.
+    /// What the sandboxed client types. It does carry a user, and that user is
+    /// deliberately the same one the allowance names, so the mediated tests
+    /// stay about what they are about. The substitution itself is exercised by
+    /// `the_remote_identity_is_the_allowances_and_not_the_clients`.
     fn target(&self) -> String {
         format!("{}@127.0.0.1", self.user)
     }
@@ -243,6 +354,100 @@ impl Sshd {
     fn client_key(&self) -> &Path {
         &self.client_key
     }
+}
+
+/// Where the bastion's outbound leg looks for the endpoint's host key.
+fn known_hosts_path(t: &NonoTest) -> PathBuf {
+    t.home().join(".ssh").join("known_hosts")
+}
+
+fn generate_key(keygen: &Path, path: &Path) {
+    let status = Command::new(keygen)
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "nono-test", "-f"])
+        .arg(path)
+        .status()
+        .expect("ssh-keygen was just resolved on PATH");
+    assert!(status.success(), "ssh-keygen failed for {}", path.display());
+}
+
+/// How many ports to try before a failure to start stops being a lost race.
+const SSHD_START_ATTEMPTS: usize = 3;
+
+/// Start `sshd` on a free loopback port, retrying when the port was taken.
+///
+/// `free_port` drops its listener before sshd binds, the tests run in parallel,
+/// and `BannerServer` draws from the same ephemeral range, so a sibling can
+/// take the port in between. sshd then exits with "Cannot bind any address"
+/// while the port still answers, to the sibling. Waiting for sshd's own pid
+/// file is what separates "sshd is up" from "something is up".
+fn spawn_sshd(sshd: &Path, dir: &Path, host_key: &Path) -> (Child, u16) {
+    let log = dir.join("sshd.log");
+    let pid_file = dir.join("sshd.pid");
+    let mut attempts = String::new();
+    for _ in 0..SSHD_START_ATTEMPTS {
+        let port = free_port();
+        let _ = fs::remove_file(&pid_file);
+        let config = write_sshd_config(dir, port, host_key, &pid_file);
+        let out = fs::File::create(&log).expect("sshd dir is a fresh dir this test owns");
+        let err = out.try_clone().expect("a just-created file clones");
+        let mut child = Command::new(sshd)
+            .arg("-D")
+            .arg("-e")
+            .arg("-f")
+            .arg(&config)
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("sshd was just resolved to an existing file");
+        if wait_for_sshd(&pid_file, port) {
+            return (child, port);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        attempts.push_str(&format!(
+            "port {port}:\n{}\n",
+            fs::read_to_string(&log).unwrap_or_default()
+        ));
+    }
+    panic!(
+        "sshd never wrote its pid file, so it never started \
+         ({SSHD_START_ATTEMPTS} attempts):\n{attempts}"
+    );
+}
+
+/// `StrictModes no` because the keys live under `target/`, and `UsePAM no`
+/// because this sshd runs as an ordinary user. Forwarding is left enabled on
+/// the server so that a refused forward is provably nono's decision and not
+/// the remote's.
+fn write_sshd_config(dir: &Path, port: u16, host_key: &Path, pid_file: &Path) -> PathBuf {
+    let config = dir.join("sshd_config");
+    fs::write(
+        &config,
+        format!(
+            "Port {port}\n\
+             ListenAddress 127.0.0.1\n\
+             HostKey {host_key}\n\
+             PidFile {pid}\n\
+             StrictModes no\n\
+             UsePAM no\n\
+             PermitUserEnvironment no\n\
+             AuthorizedKeysFile {authorized}\n\
+             PubkeyAuthentication yes\n\
+             PasswordAuthentication no\n\
+             KbdInteractiveAuthentication no\n\
+             AllowTcpForwarding yes\n\
+             AllowAgentForwarding yes\n\
+             PermitTTY yes\n\
+             Subsystem sftp internal-sftp\n\
+             PrintMotd no\n\
+             LogLevel VERBOSE\n",
+            host_key = host_key.display(),
+            pid = pid_file.display(),
+            authorized = dir.join("client_key.pub").display(),
+        ),
+    )
+    .expect("sshd dir is a fresh dir this test owns");
+    config
 }
 
 impl Drop for Sshd {
@@ -270,17 +475,27 @@ fn remote_user() -> Option<String> {
         .filter(|user| !user.is_empty())
 }
 
-fn wait_for_port(port: u16) -> bool {
+/// `sshd` is up when it has written its own pid file and its port answers.
+fn wait_for_sshd(pid_file: &Path, port: u16) -> bool {
     let deadline = Instant::now() + Duration::from_secs(15);
-    let addr = (std::net::Ipv4Addr::LOCALHOST, port).into();
     while Instant::now() < deadline {
-        if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
-            let _ = stream.shutdown(Shutdown::Both);
+        if pid_file.is_file() && port_answers(port) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     false
+}
+
+fn port_answers(port: u16) -> bool {
+    let addr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+    match TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
+        Ok(stream) => {
+            let _ = stream.shutdown(Shutdown::Both);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// A Nix-store-linked binary loads its interpreter and libc from `/nix/store`,
@@ -295,7 +510,8 @@ fn runtime_groups() -> &'static str {
 
 /// Everything the sandboxed child has to be able to exec: `nono` itself (the
 /// `ProxyCommand`), the real `ssh` the generated wrapper hands off to, the
-/// shell that resolves that wrapper, and `python3` for the raw probes.
+/// shell that resolves that wrapper, `python3` for the raw probes, and the
+/// `git`/`sftp`/`scp` clients that ride the same mediated route.
 fn read_paths() -> Vec<String> {
     let mut paths = vec![
         nono_bin()
@@ -305,6 +521,9 @@ fn read_paths() -> Vec<String> {
     ];
     for candidate in [
         which("ssh"),
+        which("git"),
+        which("sftp"),
+        which("scp"),
         fs::canonicalize(SHELL).ok(),
         python3_bin().map(PathBuf::from),
     ]
@@ -314,6 +533,11 @@ fn read_paths() -> Vec<String> {
         if let Some(dir) = candidate.parent() {
             paths.push(dir.to_path_buf());
         }
+    }
+    // `git` execs its subcommands out of its own libexec dir, which is not
+    // where the `git` binary itself lives on most distributions.
+    if let Some(exec_path) = git_exec_path() {
+        paths.push(exec_path);
     }
     if Path::new("/etc/ssh").is_dir() {
         paths.push(PathBuf::from("/etc/ssh"));
@@ -325,6 +549,15 @@ fn read_paths() -> Vec<String> {
     rendered.sort();
     rendered.dedup();
     rendered
+}
+
+fn git_exec_path() -> Option<PathBuf> {
+    let out = Command::new(which("git")?)
+        .arg("--exec-path")
+        .output()
+        .ok()?;
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    path.is_dir().then_some(path)
 }
 
 /// Profile granting read (and therefore execute) on everything the mediated
@@ -468,12 +701,12 @@ except PermissionError as err:
 
 /// The hole this pin closes: on an open policy the allowance must still be an
 /// allowance, not a decoration. `localhost` is the same machine on the same
-/// pinned port, and is still refused, because the pin names an authority and
-/// nothing else may use that port.
+/// pinned port, and is still refused, because the pin closes that port
+/// everywhere.
 #[test]
 fn ssh_pin_refuses_another_host_on_an_open_policy() {
     let Some(py) = python3_bin() else {
-        eprintln!("skipping: no usable python3 available");
+        skip("no usable python3 available");
         return;
     };
     let server = BannerServer::start();
@@ -498,7 +731,7 @@ fn ssh_pin_refuses_another_host_on_an_open_policy() {
 #[test]
 fn ssh_pin_leaves_other_ports_open_on_an_open_policy() {
     let Some(py) = python3_bin() else {
-        eprintln!("skipping: no usable python3 available");
+        skip("no usable python3 available");
         return;
     };
     let server = BannerServer::start();
@@ -525,7 +758,7 @@ fn ssh_pin_leaves_other_ports_open_on_an_open_policy() {
 #[test]
 fn connect_to_the_allowed_endpoint_through_the_proxy_is_refused() {
     let Some(py) = python3_bin() else {
-        eprintln!("skipping: no usable python3 available");
+        skip("no usable python3 available");
         return;
     };
     let server = BannerServer::start();
@@ -533,6 +766,68 @@ fn connect_to_the_allowed_endpoint_through_the_proxy_is_refused() {
     let state = ShortState::new(&t);
     let endpoint = format!("127.0.0.1:{}", server.port);
     let profile = t.write_profile("ssh-connect", &filtered_profile(&endpoint));
+
+    t.run()
+        .env("XDG_STATE_HOME", state.path())
+        .profile(&profile)
+        .exec(
+            Argv::new(&py)
+                .arg("-c")
+                .arg(connect_probe("127.0.0.1", server.port)),
+        )
+        .assert_stdout_contains("403")
+        .assert_stdout_lacks("SSH-2.0-nono-test");
+}
+
+/// The regression this suite previously could not see. The pin used to exempt
+/// its own authority, so the endpoint stayed reachable as raw TCP wherever the
+/// allowlist did not independently refuse it. On an open policy the allowlist
+/// refuses nothing, so the allowance handed the sandbox exactly the
+/// byte-transparent tunnel the bastion exists to take away. The pinned port
+/// must be shut on the endpoint itself, not only on every other host.
+#[test]
+fn connect_to_the_allowed_endpoint_is_refused_on_an_open_policy() {
+    let Some(py) = python3_bin() else {
+        skip("no usable python3 available");
+        return;
+    };
+    let server = BannerServer::start();
+    let t = nono_test!("ssh-connect-open");
+    let state = ShortState::new(&t);
+    let profile = t.write_profile("ssh-connect-open", &open_profile(server.port));
+
+    t.run()
+        .env("XDG_STATE_HOME", state.path())
+        .profile(&profile)
+        .exec(
+            Argv::new(&py)
+                .arg("-c")
+                .arg(connect_probe("127.0.0.1", server.port)),
+        )
+        .assert_stdout_contains("403")
+        .assert_stdout_lacks("SSH-2.0-nono-test");
+}
+
+/// The same hole reached from the other side: an `allow_domain` entry naming
+/// the endpoint's own host must not buy back the pinned port. The pin is
+/// evaluated before the allowlist precisely so a domain allowance cannot
+/// reopen it.
+#[test]
+fn an_allow_domain_for_the_endpoint_does_not_reopen_the_pinned_port() {
+    let Some(py) = python3_bin() else {
+        skip("no usable python3 available");
+        return;
+    };
+    let server = BannerServer::start();
+    let t = nono_test!("ssh-connect-domain");
+    let state = ShortState::new(&t);
+    let profile = t.write_profile(
+        "ssh-connect-domain",
+        &profile_json(&format!(
+            r#"{{"allow_domain":["127.0.0.1"],"allow_ssh":["127.0.0.1:{}"]}}"#,
+            server.port
+        )),
+    );
 
     t.run()
         .env("XDG_STATE_HOME", state.path())
@@ -679,21 +974,34 @@ fn proxy_jump_through_the_allowed_endpoint_is_refused() {
 /// `-A` asks for the agent to be forwarded. It is refused, so the remote side
 /// has no agent to use: the credential nono signs with never leaves the
 /// parent, and offering it to the remote host would make it a signing oracle.
+///
+/// `agent=none` alone would not prove that. It is equally true when the client
+/// never asked, which is in fact what a plain `ssh -A` does here: the
+/// generated config sets `IdentityAgent none`, so OpenSSH decides it has no
+/// agent to forward and sends nothing. A sandboxed process can override that
+/// on its own command line, which is the case worth pinning, so the test does
+/// exactly that and then asks the bastion to say no by name.
 #[test]
 fn agent_forwarding_leaves_no_agent_on_the_remote_side() {
     let t = nono_test!("ssh-agent");
     let state = ShortState::new(&t);
     let Some(sshd) = Sshd::start(&t) else { return };
+    let Some(agent) = Agent::start(None) else {
+        return;
+    };
     let profile = t.write_profile("ssh-agent", &filtered_profile(&sshd.allowance()));
 
     mediated(&t, &state, &sshd)
+        .env("SSH_AUTH_SOCK", agent.path())
         .profile(&profile)
         .exec(shell(&format!(
-            "ssh -A -p {} {} 'echo agent=${{SSH_AUTH_SOCK:-none}}'",
+            "ssh -o IdentityAgent=\"$SSH_AUTH_SOCK\" -A -p {} {} \
+             'echo agent=${{SSH_AUTH_SOCK:-none}}'",
             sshd.port,
             sshd.target()
         )))
         .assert_success("refusing agent forwarding must not break the session")
+        .assert_stderr_contains("auth-agent-req@openssh.com")
         .assert_stdout_contains("agent=none");
 }
 
@@ -745,7 +1053,7 @@ fn ssh_allowance_refuses_another_port_on_the_same_host() {
 #[test]
 fn direct_socket_to_the_allowed_endpoint_is_denied_even_without_proxy_env() {
     let Some(py) = python3_bin() else {
-        eprintln!("skipping: no usable python3 available");
+        skip("no usable python3 available");
         return;
     };
     let t = nono_test!("ssh-direct");
@@ -770,7 +1078,7 @@ fn direct_socket_to_the_allowed_endpoint_is_denied_even_without_proxy_env() {
 #[test]
 fn allow_domain_port_suffix_still_widens_to_every_port() {
     let Some(py) = python3_bin() else {
-        eprintln!("skipping: no usable python3 available");
+        skip("no usable python3 available");
         return;
     };
     let server = BannerServer::start();
@@ -892,15 +1200,22 @@ fn a_restricted_endpoint_refuses_a_session_with_no_command() {
 /// `af_unix_mediation` is on because AF_UNIX is unmediated by default in
 /// proxy-only mode, so without it the agent socket is reachable for reasons
 /// that have nothing to do with `allow_ssh`.
+///
+/// The agent socket is this test's own: a real listening `AF_UNIX` socket
+/// named by `SSH_AUTH_SOCK`, so the probe has something to fail to connect to.
+/// Reading `agent=unreachable` off an unset variable would pass whether or not
+/// the mediation does anything at all, which is why a missing variable is a
+/// failure here and not a pass.
 #[test]
 fn a_mediated_session_leaves_no_credential_reachable_in_the_sandbox() {
     let Some(py) = python3_bin() else {
-        eprintln!("skipping: no usable python3 available");
+        skip("no usable python3 available");
         return;
     };
     let t = nono_test!("ssh-contain");
     let state = ShortState::new(&t);
     let Some(sshd) = Sshd::start(&t) else { return };
+    let agent = DecoySocket::bind("agent");
     let profile = t.write_profile(
         "ssh-contain",
         &profile_json_with(
@@ -916,14 +1231,14 @@ fn a_mediated_session_leaves_no_credential_reachable_in_the_sandbox() {
 import os, socket
 
 agent = os.environ.get("SSH_AUTH_SOCK")
-if agent:
+if not agent:
+    print("agent=no-env")
+else:
     try:
         socket.socket(socket.AF_UNIX).connect(agent)
         print("agent=reachable")
     except OSError:
         print("agent=unreachable")
-else:
-    print("agent=unreachable")
 try:
     open("@KEY@", "rb").read()
     print("key=readable")
@@ -933,6 +1248,7 @@ except OSError:
     let probe = PROBE.replace("@KEY@", &sshd.client_key().to_string_lossy());
 
     mediated(&t, &state, &sshd)
+        .env("SSH_AUTH_SOCK", agent.path())
         .profile(&profile)
         .exec(shell(&format!(
             "{py} -c '{probe}' && ssh -p {port} {target} \"echo mediated-ok\"",
@@ -942,6 +1258,7 @@ except OSError:
         .assert_success("the session must still work with nothing granted")
         .assert_stdout_contains("mediated-ok")
         .assert_stdout_contains("agent=unreachable")
+        .assert_stdout_lacks("agent=no-env")
         .assert_stdout_contains("key=unreadable");
 }
 
@@ -971,4 +1288,392 @@ fn ssh_relay_without_a_bastion_fails_instead_of_connecting_directly() {
         "the failure must name the variable that was missing, got: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The remote identity is the allowance's and the sandbox cannot choose
+/// another one. Every other mediated test names the same user on both sides,
+/// where the substitution is unobservable, so this is the only place the
+/// headline behaviour of the change is actually exercised.
+#[test]
+fn the_remote_identity_is_the_allowances_and_not_the_clients() {
+    let t = nono_test!("ssh-user");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let profile = t.write_profile("ssh-user", &filtered_profile(&sshd.allowance()));
+
+    let completed = mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "ssh -p {} root@127.0.0.1 'id -un'",
+            sshd.port
+        )))
+        .assert_success("asking for another remote user must not break the session")
+        .assert_stdout_contains(&sshd.user);
+    if sshd.user != "root" {
+        completed.assert_stdout_lacks("root");
+    }
+}
+
+/// The metacharacter refusal is covered as a pure function and never on the
+/// wire, so a regression that ran `exec` before authorizing would pass the
+/// whole unit suite. The spec's claim is that neither command runs, and only a
+/// runtime test can make it: the marker is what the second command would
+/// leave behind.
+#[test]
+fn a_command_carrying_a_metacharacter_runs_nothing_on_the_remote_host() {
+    let t = nono_test!("ssh-meta");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let profile = t.write_profile(
+        "ssh-meta",
+        &restricted_profile(&sshd.allowance(), r#""echo allowed-command""#),
+    );
+    let marker = t.root().join("metacharacter-marker");
+
+    mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "ssh -p {port} {target} 'echo allowed-command; touch {marker}'",
+            port = sshd.port,
+            target = sshd.target(),
+            marker = marker.display(),
+        )))
+        .assert_failure("a command carrying a separator must be refused")
+        .assert_stdout_lacks("allowed-command")
+        .assert_stderr_contains("shell metacharacter");
+
+    assert!(
+        !marker.exists(),
+        "the command after the separator ran: {} exists",
+        marker.display()
+    );
+}
+
+/// OpenSSH's Git integration quotes the repository path and a plain
+/// `ssh host cmd` does not. Tokenising both sides is what makes those the same
+/// rule, and until now that only held for a pure function.
+#[test]
+fn a_quoted_argument_matches_the_unquoted_rule_on_the_wire() {
+    let t = nono_test!("ssh-quote");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let profile = t.write_profile(
+        "ssh-quote",
+        &restricted_profile(&sshd.allowance(), r#""echo /srv/repo.git""#),
+    );
+
+    mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "ssh -p {port} {target} \"echo '/srv/repo.git'\"",
+            port = sshd.port,
+            target = sshd.target(),
+        )))
+        .assert_success("a quoted argument is the same argument")
+        .assert_stdout_contains("/srv/repo.git");
+}
+
+/// The outbound leg never trusts on first use, and never records a key on the
+/// sandbox's behalf. Both refusal paths are otherwise dead to this suite,
+/// because the fixture always writes `known_hosts`.
+#[test]
+fn an_unknown_host_key_is_refused_without_recording_it() {
+    let t = nono_test!("ssh-unknown-key");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start_untrusted(&t) else {
+        return;
+    };
+    let profile = t.write_profile("ssh-unknown-key", &filtered_profile(&sshd.allowance()));
+
+    mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "ssh -p {} {} 'echo reached-unknown-host'",
+            sshd.port,
+            sshd.target()
+        )))
+        .assert_failure("a host key nobody recorded must not be trusted on first use")
+        .assert_stdout_lacks("reached-unknown-host")
+        .assert_stderr_contains("does not trust a host key on first use");
+
+    assert!(
+        !known_hosts_path(&t).exists(),
+        "the refusal must leave the store alone, but {} was written",
+        known_hosts_path(&t).display()
+    );
+}
+
+/// A host presenting a key other than the recorded one is the case the whole
+/// check exists for, and the message has to say which endpoint changed.
+#[test]
+fn a_changed_host_key_is_refused_and_names_the_endpoint() {
+    let t = nono_test!("ssh-changed-key");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start_untrusted(&t) else {
+        return;
+    };
+    sshd.trust_a_different_host_key(&t);
+    let recorded = fs::read_to_string(known_hosts_path(&t)).expect("the fixture just wrote it");
+    let profile = t.write_profile("ssh-changed-key", &filtered_profile(&sshd.allowance()));
+
+    mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "ssh -p {} {} 'echo reached-changed-host'",
+            sshd.port,
+            sshd.target()
+        )))
+        .assert_failure("a key that differs from the recorded one must be refused")
+        .assert_stdout_lacks("reached-changed-host")
+        .assert_stderr_contains(&format!("127.0.0.1:{}", sshd.port))
+        .assert_stderr_contains("differs from the one recorded");
+
+    assert_eq!(
+        fs::read_to_string(known_hosts_path(&t)).expect("the store is still there"),
+        recorded,
+        "a refusal must not rewrite the store"
+    );
+}
+
+/// The default credential path. Every other mediated test sets
+/// `NONO_SSH_KEY`, so `authenticate_with_agent` has no coverage at all
+/// otherwise, and it is the one a user gets without passing a flag.
+#[test]
+fn an_agent_backed_credential_authenticates_the_outbound_leg() {
+    let t = nono_test!("ssh-agent-auth");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let Some(agent) = Agent::start(Some(sshd.client_key())) else {
+        return;
+    };
+    let profile = t.write_profile("ssh-agent-auth", &filtered_profile(&sshd.allowance()));
+
+    t.run()
+        .env("XDG_STATE_HOME", state.path())
+        .env("SSH_AUTH_SOCK", agent.path())
+        .profile(&profile)
+        .exec(shell(&format!(
+            "ssh -p {} {} 'echo agent-auth-ok'",
+            sshd.port,
+            sshd.target()
+        )))
+        .assert_success("the host's agent must be able to authenticate the outbound leg")
+        .assert_stdout_contains("agent-auth-ok");
+}
+
+/// `pty-req` and `window-change` are exercised nowhere outside the pure policy
+/// function. A forced pty is the cheap half: `stty size` needs a terminal to
+/// answer at all, so an unrelayed `pty-req` shows up as a failure here.
+#[test]
+fn an_interactive_pty_reports_a_terminal_size() {
+    let t = nono_test!("ssh-pty");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let profile = t.write_profile("ssh-pty", &filtered_profile(&sshd.allowance()));
+
+    let completed = mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "ssh -tt -p {} {} 'stty size'",
+            sshd.port,
+            sshd.target()
+        )))
+        .assert_success("a forced pty must be relayed to the remote host");
+
+    let stdout = completed.stdout();
+    assert!(
+        stdout.lines().any(is_terminal_size),
+        "stty size must report rows and columns, got: {stdout}"
+    );
+}
+
+/// `stty size` prints exactly two integers, and under a pty the line ends CRLF.
+fn is_terminal_size(line: &str) -> bool {
+    let mut fields = line.trim().split_whitespace();
+    let rows = fields.next().and_then(|f| f.parse::<u32>().ok());
+    let columns = fields.next().and_then(|f| f.parse::<u32>().ok());
+    matches!((rows, columns, fields.next()), (Some(_), Some(_), None))
+}
+
+/// `sftp` is a `subsystem` request, which is the one thing in the default
+/// policy that is neither a shell nor a command, and the networking page
+/// promises users it keeps working.
+#[test]
+fn sftp_runs_as_a_subsystem_over_the_mediated_route() {
+    let Some(sftp) = which("sftp") else {
+        skip("no sftp client on PATH");
+        return;
+    };
+    let t = nono_test!("ssh-sftp");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let profile = t.write_profile("ssh-sftp", &filtered_profile(&sshd.allowance()));
+
+    mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "echo pwd | {sftp} -S \"$(command -v ssh)\" -b - -P {port} {target}",
+            sftp = sftp.display(),
+            port = sshd.port,
+            target = sshd.target(),
+        )))
+        .assert_success("a file-transfer subsystem must run over the mediated route")
+        .assert_stdout_contains("Remote working directory");
+}
+
+/// `scp` is the other client the networking page promises keeps working, and
+/// it is the one that actually moves bytes rather than just listing.
+#[test]
+fn scp_copies_a_file_over_the_mediated_route() {
+    let Some(scp) = which("scp") else {
+        skip("no scp client on PATH");
+        return;
+    };
+    let t = nono_test!("ssh-scp");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let profile = t.write_profile("ssh-scp", &filtered_profile(&sshd.allowance()));
+    let source = t.root().join("scp-source.txt");
+    fs::write(&source, "copied-content\n").expect("test root is a fresh dir this test owns");
+
+    mediated(&t, &state, &sshd)
+        .allow_cwd()
+        .profile(&profile)
+        .exec(shell(&format!(
+            "{scp} -S \"$(command -v ssh)\" -P {port} {target}:{source} fetched.txt \
+             && cat fetched.txt",
+            scp = scp.display(),
+            port = sshd.port,
+            target = sshd.target(),
+            source = source.display(),
+        )))
+        .assert_success("scp must move bytes over the mediated route")
+        .assert_stdout_contains("copied-content");
+}
+
+/// A clone over SSH is the reason the mediation exists. It also proves the
+/// generated `GIT_SSH_COMMAND` wiring end to end, which no other test does.
+#[test]
+fn git_clones_over_the_mediated_route() {
+    let t = nono_test!("ssh-git");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let Some(origin) = bare_repo_with_a_commit(&t) else {
+        return;
+    };
+    let profile = t.write_profile("ssh-git", &filtered_profile(&sshd.allowance()));
+
+    mediated(&t, &state, &sshd)
+        .allow_cwd()
+        .profile(&profile)
+        .exec(shell(&format!(
+            "{env} git clone -q {url} cloned && cat cloned/file.txt",
+            env = GIT_NO_CONFIG,
+            url = ssh_url(&sshd, &origin),
+        )))
+        .assert_success("a clone over the mediated route must succeed")
+        .assert_stdout_contains("committed-content");
+}
+
+/// The command allowlist's headline example. `git-upload-pack <path>` is the
+/// one case where OpenSSH's quoting has to survive tokenisation on the wire,
+/// and listing only it must leave `git push` refused.
+#[test]
+fn a_command_list_naming_upload_pack_allows_a_clone_and_refuses_a_push() {
+    let t = nono_test!("ssh-git-acl");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let Some(origin) = bare_repo_with_a_commit(&t) else {
+        return;
+    };
+    let profile = t.write_profile(
+        "ssh-git-acl",
+        &restricted_profile(
+            &sshd.allowance(),
+            &format!(r#""git-upload-pack {}""#, origin.display()),
+        ),
+    );
+
+    mediated(&t, &state, &sshd)
+        .allow_cwd()
+        .profile(&profile)
+        .exec(shell(&format!(
+            "{env} git clone -q {url} cloned && echo clone-ok && cd cloned && \
+             {env} git -c user.email=nono@test -c user.name=nono commit -q --allow-empty \
+             -m pushed && {env} git push -q origin HEAD:main",
+            env = GIT_NO_CONFIG,
+            url = ssh_url(&sshd, &origin),
+        )))
+        .assert_failure("a push runs git-receive-pack, which the list does not name")
+        .assert_stdout_contains("clone-ok")
+        .assert_stderr_contains("network.allow_ssh refused the remote command")
+        .assert_stderr_contains("git-receive-pack");
+}
+
+/// Git reads `~/.gitconfig` and `/etc/gitconfig`, neither of which the test
+/// profile grants. Pointing both at `/dev/null` keeps the test about SSH.
+const GIT_NO_CONFIG: &str = "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null";
+
+fn ssh_url(sshd: &Sshd, repo: &Path) -> String {
+    format!(
+        "ssh://{}@127.0.0.1:{}{}",
+        sshd.user,
+        sshd.port,
+        repo.display()
+    )
+}
+
+/// A bare repository with one commit, built outside the sandbox, for the
+/// mediated clone to fetch.
+fn bare_repo_with_a_commit(t: &NonoTest) -> Option<PathBuf> {
+    let Some(git) = which("git") else {
+        skip("no git on PATH");
+        return None;
+    };
+    let work = t.root().join("origin-work");
+    let repo = t.root().join("origin.git");
+    fs::create_dir_all(&work).expect("test root is a fresh dir this test owns");
+    run_git(&git, &work, &["init", "-q", "-b", "main"]);
+    fs::write(work.join("file.txt"), "committed-content\n")
+        .expect("the work tree is a fresh dir this test owns");
+    run_git(&git, &work, &["add", "file.txt"]);
+    run_git(
+        &git,
+        &work,
+        &[
+            "-c",
+            "user.email=nono@test",
+            "-c",
+            "user.name=nono",
+            "commit",
+            "-q",
+            "-m",
+            "first",
+        ],
+    );
+    run_git(
+        &git,
+        t.root(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &work.to_string_lossy(),
+            &repo.to_string_lossy(),
+        ],
+    );
+    Some(repo)
+}
+
+fn run_git(git: &Path, cwd: &Path, args: &[&str]) {
+    let status = Command::new(git)
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("git was just resolved on PATH");
+    assert!(status.success(), "git {args:?} failed in {}", cwd.display());
 }

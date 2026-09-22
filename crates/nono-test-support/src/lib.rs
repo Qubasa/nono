@@ -124,6 +124,11 @@ impl NonoTest {
             // above: no test may depend on the developer's environment to keep
             // the background network update check off.
             .env("NONO_NO_UPDATE_CHECK", "1")
+            // Assertions on warn-level diagnostics (the SSH mediation's
+            // refusals, for one) hold only at the default filter. An inherited
+            // RUST_LOG would raise or lower it and fail them for a reason that
+            // has nothing to do with the behaviour under test.
+            .env_remove("RUST_LOG")
             .current_dir(&self.workspace);
         cmd
     }

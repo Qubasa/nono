@@ -30,22 +30,28 @@ pub struct ProxyFilter {
     ssh_pins: SshPins,
 }
 
-/// Port-exact SSH endpoints: every port named here is closed on every host
-/// that is not listed, whatever the allowlist says.
+/// Port-exact SSH endpoints: every port named here is closed on every host,
+/// including the endpoint's own.
 ///
 /// This is what makes `network.allow_ssh` narrowing. The allowlist alone
 /// cannot express it: an empty allowlist means allow-all, so adding the
 /// endpoint to it would either change nothing or, if it were the only
 /// entry, close every other destination too.
+///
+/// The allowed endpoint is pinned shut too, and that is the point. An
+/// allowance grants a mediated SSH session, not reachability: nono's own
+/// outbound leg dials the endpoint directly from the parent and never
+/// traverses this proxy, so leaving the authority reachable here would hand
+/// the sandbox the raw byte-transparent tunnel the mediation exists to take
+/// away.
 #[derive(Debug, Clone, Default)]
 struct SshPins {
     ports: BTreeSet<u16>,
-    authorities: BTreeSet<String>,
 }
 
 impl SshPins {
-    fn denies(&self, authority: &str, port: u16) -> bool {
-        self.ports.contains(&port) && !self.authorities.contains(authority)
+    fn denies(&self, port: u16) -> bool {
+        self.ports.contains(&port)
     }
 }
 
@@ -91,22 +97,21 @@ impl ProxyFilter {
         }
     }
 
-    /// Pin the ports named by `network.allow_ssh` to the hosts listed.
+    /// Pin the ports named by `network.allow_ssh`.
     ///
-    /// Entries are `host:port`. Each port becomes unreachable on every other
-    /// host, so a lone SSH allowance narrows port 22 without closing any
-    /// other port. An entry that is not `host:port` is dropped with a
-    /// warning: it can only ever have contributed a deny, so dropping it
-    /// leaves the port as open as it was, never more open.
+    /// Entries are `host:port`. Each port becomes unreachable on every host,
+    /// so a lone SSH allowance closes port 22 without closing any other port.
+    /// An entry that is not `host:port` is dropped with a warning: it can
+    /// only ever have contributed a deny, so dropping it leaves the port as
+    /// open as it was, never more open.
     #[must_use]
     pub fn with_ssh_endpoints(mut self, endpoints: &[String]) -> Self {
         for entry in endpoints {
-            let Some((host, port)) = split_authority(entry) else {
+            let Some((_, port)) = split_authority(entry) else {
                 tracing::warn!("ignoring malformed allow_ssh endpoint: {entry}");
                 continue;
             };
             self.ssh_pins.ports.insert(port);
-            self.ssh_pins.authorities.insert(authority(&host, port));
         }
         self
     }
@@ -174,7 +179,7 @@ impl ProxyFilter {
     fn check_host_result(&self, host: &str, port: u16, resolved_ips: &[IpAddr]) -> FilterResult {
         let host_port = authority(host, port);
 
-        if self.ssh_pins.denies(&host_port, port) {
+        if self.ssh_pins.denies(port) {
             return FilterResult::DenyNotAllowed { host: host_port };
         }
 
@@ -267,55 +272,57 @@ mod tests {
         assert!(!result.is_allowed());
     }
 
-    /// The whole point of `allow_ssh`: on an open policy it must close the
-    /// SSH port everywhere else without closing any other port.
+    /// The whole point of `allow_ssh`: on an open policy it closes the SSH
+    /// port everywhere, including on the endpoint itself, without closing any
+    /// other port. The endpoint is reached by nono's own outbound leg from
+    /// the parent, which never traverses this filter.
     #[test]
-    fn test_ssh_pins_narrow_only_their_own_port() {
+    fn test_ssh_pins_close_their_port_everywhere() {
         let ip = vec![IpAddr::V4(Ipv4Addr::new(5, 9, 99, 136))];
-        let filter =
-            ProxyFilter::allow_all().with_ssh_endpoints(&["5.9.99.136:22".to_string()]);
+        let filter = ProxyFilter::allow_all().with_ssh_endpoints(&["5.9.99.136:22".to_string()]);
 
-        assert!(filter.check_host_result("5.9.99.136", 22, &ip).is_allowed());
+        assert!(
+            !filter.check_host_result("5.9.99.136", 22, &ip).is_allowed(),
+            "the allowance grants a mediated session, not a raw tunnel to the endpoint"
+        );
         assert!(!filter.check_host_result("gchq.icu", 22, &ip).is_allowed());
         assert!(filter.check_host_result("gchq.icu", 443, &ip).is_allowed());
         assert!(
-            filter.check_host_result("5.9.99.136", 443, &ip).is_allowed(),
+            filter
+                .check_host_result("5.9.99.136", 443, &ip)
+                .is_allowed(),
             "a pin closes its port, not its host: HTTPS to that host is \
              no more restricted than HTTPS anywhere else"
         );
     }
 
-    /// A wildcard allowlist entry must not reopen a pinned port.
+    /// A wildcard allowlist entry must not reopen a pinned port, and naming
+    /// the endpoint in the allowlist must not buy it back either.
     #[test]
     fn test_ssh_pins_outrank_a_wildcard_allowlist() {
         let ip = vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))];
-        let filter = ProxyFilter::new(&["*".to_string()])
+        let filter = ProxyFilter::new(&["*".to_string(), "build.example.com".to_string()])
             .with_ssh_endpoints(&["build.example.com:22".to_string()]);
 
         assert!(!filter.check_host_result("evil.com", 22, &ip).is_allowed());
+        assert!(
+            !filter
+                .check_host_result("build.example.com", 22, &ip)
+                .is_allowed(),
+            "an allow_domain entry for the same host must not reopen the pinned port"
+        );
         assert!(filter.check_host_result("evil.com", 80, &ip).is_allowed());
     }
 
-    /// Entries and incoming hosts are normalized the same way, so a trailing
-    /// dot or a different case cannot slip past the pin.
-    #[test]
-    fn test_ssh_pins_normalize_both_sides() {
-        let ip = vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))];
-        let filter = ProxyFilter::allow_all()
-            .with_ssh_endpoints(&["Build.Example.com.:22".to_string()]);
-
-        assert!(filter.check_host_result("build.example.com", 22, &ip).is_allowed());
-        assert!(filter.check_host_result("BUILD.example.com.", 22, &ip).is_allowed());
-        assert!(!filter.check_host_result("build.example.com.evil.com", 22, &ip).is_allowed());
-    }
-
+    /// A bracketed IPv6 entry still contributes its port to the pin.
     #[test]
     fn test_ssh_pins_accept_bracketed_ipv6_entries() {
         let ip = vec![IpAddr::V6(Ipv6Addr::LOCALHOST)];
         let filter = ProxyFilter::allow_all().with_ssh_endpoints(&["[::1]:2222".to_string()]);
 
-        assert!(filter.check_host_result("::1", 2222, &ip).is_allowed());
+        assert!(!filter.check_host_result("::1", 2222, &ip).is_allowed());
         assert!(!filter.check_host_result("::2", 2222, &ip).is_allowed());
+        assert!(filter.check_host_result("::1", 443, &ip).is_allowed());
     }
 
     #[test]

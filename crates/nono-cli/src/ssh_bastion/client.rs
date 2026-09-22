@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::audit;
 use super::credential::SshCredential;
+use super::policy::{ChannelDecision, RemoteChannelKind, authorize_remote_channel};
 
 /// How long the outbound session tolerates silence before giving up.
 const OUTBOUND_INACTIVITY: Duration = Duration::from_secs(3600);
@@ -44,6 +46,18 @@ pub(crate) struct OutboundHandler {
     port: u16,
     known_hosts: PathBuf,
     verdict: HostKeyVerdict,
+}
+
+impl OutboundHandler {
+    /// Refuse a channel the remote host opened toward nono.
+    ///
+    /// Dropping the handle is what rejects it. russh's defaults accept most of
+    /// these, so every one of them is named here rather than left to them.
+    fn refuse_remote(&self, kind: RemoteChannelKind) {
+        if let ChannelDecision::Refuse(refusal) = authorize_remote_channel(kind) {
+            audit::refused_remote(&self.host, self.port, &refusal);
+        }
+    }
 }
 
 impl client::Handler for OutboundHandler {
@@ -100,6 +114,88 @@ impl client::Handler for OutboundHandler {
             }
         }
     }
+
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        self.refuse_remote(RemoteChannelKind::Session);
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        _reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        self.refuse_remote(RemoteChannelKind::X11);
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        self.refuse_remote(RemoteChannelKind::DirectTcpip);
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _socket_path: &str,
+        _reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        self.refuse_remote(RemoteChannelKind::DirectStreamlocal);
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        self.refuse_remote(RemoteChannelKind::ForwardedTcpip);
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _socket_path: &str,
+        _reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        self.refuse_remote(RemoteChannelKind::ForwardedStreamlocal);
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        self.refuse_remote(RemoteChannelKind::AgentForward);
+        Ok(())
+    }
 }
 
 /// An authenticated outbound session.
@@ -145,34 +241,44 @@ pub(crate) async fn connect(
     Ok(Outbound { handle })
 }
 
+/// Why an outbound authentication did not happen, phrased for the user who
+/// wrote the allowance.
+fn refused(endpoint: &SshEndpoint, user: &str, detail: &str) -> NonoError {
+    NonoError::SshBastion(format!(
+        "network.allow_ssh could not authenticate to {}@{}:{}: {detail}",
+        user, endpoint.host, endpoint.port
+    ))
+}
+
 async fn authenticate(
     handle: &mut client::Handle<OutboundHandler>,
     endpoint: &SshEndpoint,
     user: &str,
     credential: &SshCredential,
 ) -> Result<()> {
-    let refused = |detail: String| {
-        NonoError::SshBastion(format!(
-            "network.allow_ssh could not authenticate to {}@{}:{} — {detail}",
-            user, endpoint.host, endpoint.port
-        ))
-    };
-
     match credential {
         SshCredential::Key(key) => {
             let hash_alg = handle
                 .best_supported_rsa_hash()
                 .await
-                .map_err(|err| refused(format!("the server rejected the key exchange: {err}")))?
+                .map_err(|err| {
+                    refused(
+                        endpoint,
+                        user,
+                        &format!("the server rejected the key exchange: {err}"),
+                    )
+                })?
                 .flatten();
-            let key = PrivateKeyWithHashAlg::new(Arc::new((**key).clone()), hash_alg);
+            let key = PrivateKeyWithHashAlg::new(key.clone(), hash_alg);
             let result = handle
                 .authenticate_publickey(user, key)
                 .await
-                .map_err(|err| refused(format!("the attempt failed: {err}")))?;
+                .map_err(|err| refused(endpoint, user, &format!("the attempt failed: {err}")))?;
             if !result.success() {
                 return Err(refused(
-                    "the server rejected the key named by --ssh-key".to_string(),
+                    endpoint,
+                    user,
+                    "the server rejected the key named by --ssh-key",
                 ));
             }
             Ok(())
@@ -193,47 +299,51 @@ async fn authenticate_with_agent(
     user: &str,
     socket: &Path,
 ) -> Result<()> {
-    let refused = |detail: String| {
-        NonoError::SshBastion(format!(
-            "network.allow_ssh could not authenticate to {}@{}:{} — {detail}",
-            user, endpoint.host, endpoint.port
-        ))
-    };
-
     let mut agent = russh::keys::agent::client::AgentClient::connect_uds(socket)
         .await
         .map_err(|err| {
-            refused(format!(
-                "the ssh-agent at {} refused: {err}",
-                socket.display()
-            ))
+            refused(
+                endpoint,
+                user,
+                &format!("the ssh-agent at {} refused: {err}", socket.display()),
+            )
         })?;
 
     let identities = agent.request_identities().await.map_err(|err| {
-        refused(format!(
-            "the ssh-agent would not list its identities: {err}"
-        ))
+        refused(
+            endpoint,
+            user,
+            &format!("the ssh-agent would not list its identities: {err}"),
+        )
     })?;
 
     if identities.is_empty() {
-        return Err(refused(format!(
-            "the ssh-agent at {} holds no identities",
-            socket.display()
-        )));
+        return Err(refused(
+            endpoint,
+            user,
+            &format!("the ssh-agent at {} holds no identities", socket.display()),
+        ));
     }
 
     let hash_alg = handle
         .best_supported_rsa_hash()
         .await
-        .map_err(|err| refused(format!("the server rejected the key exchange: {err}")))?
+        .map_err(|err| {
+            refused(
+                endpoint,
+                user,
+                &format!("the server rejected the key exchange: {err}"),
+            )
+        })?
         .flatten();
 
     // Each identity in turn, as OpenSSH does. A certificate is offered as a
     // certificate rather than as the key inside it, because a server that
     // trusts the CA may not know the key at all.
+    let mut unsignable = Vec::new();
     for identity in identities {
         let fingerprint = identity.public_key().fingerprint(ssh_key::HashAlg::Sha256);
-        let result = match identity {
+        let attempt = match identity {
             russh::keys::agent::AgentIdentity::PublicKey { key, .. } => {
                 handle
                     .authenticate_publickey_with(user, key, hash_alg, &mut agent)
@@ -244,8 +354,18 @@ async fn authenticate_with_agent(
                     .authenticate_certificate_with(user, certificate, hash_alg, &mut agent)
                     .await
             }
-        }
-        .map_err(|err| refused(format!("the ssh-agent could not sign: {err}")))?;
+        };
+        // An `Err` here is the agent declining to sign, not the server
+        // declining the key: a FIDO key whose token is absent, a touch that
+        // timed out, a locked smartcard. OpenSSH moves to the next identity,
+        // and so does nono.
+        let result = match attempt {
+            Ok(result) => result,
+            Err(err) => {
+                unsignable.push(format!("{fingerprint} ({err})"));
+                continue;
+            }
+        };
         if result.success() {
             tracing::debug!(
                 "ssh bastion authenticated to {}@{}:{} with agent identity {fingerprint}",
@@ -257,7 +377,19 @@ async fn authenticate_with_agent(
         }
     }
 
+    if unsignable.is_empty() {
+        return Err(refused(
+            endpoint,
+            user,
+            "the server rejected every identity the ssh-agent holds",
+        ));
+    }
     Err(refused(
-        "the server rejected every identity the ssh-agent holds".to_string(),
+        endpoint,
+        user,
+        &format!(
+            "no identity the ssh-agent holds was accepted, and it would not sign with {}",
+            unsignable.join(", ")
+        ),
     ))
 }

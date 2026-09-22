@@ -1642,8 +1642,36 @@ pub(crate) fn prepare_proxy_launch_options(
             ));
         }
     }
+    reject_ssh_with_command_policies(&opts)?;
 
     Ok(NetworkIntent::ProxyFiltered(Box::new(opts)))
+}
+
+/// `network.allow_ssh` reaches the sandboxed child as `NONO_SSH_BASTION` and
+/// `GIT_SSH_COMMAND`, and a tool-sandboxed child receives neither:
+/// `filter_child_env` in tool-sandbox/platform/linux.rs strips every `NONO_`
+/// variable, and `DEFAULT_ENV_ALLOW` in tool-sandbox/env.rs does not carry
+/// `GIT_SSH_COMMAND`. Those two are what would have to change to lift this.
+fn reject_ssh_with_command_policies(opts: &ProxyLaunchOptions) -> Result<()> {
+    let has_ssh = opts
+        .domain_filter
+        .as_ref()
+        .is_some_and(|filter| !filter.allow_ssh.is_empty());
+    let has_policies = opts
+        .command_policies
+        .as_ref()
+        .is_some_and(|policies| policies.is_active());
+    if has_ssh && has_policies {
+        return Err(NonoError::ConfigParse(
+            "network.allow_ssh does not yet work together with command_policies.commands: a \
+             tool-sandboxed child does not inherit nono's environment namespace, so the SSH \
+             mediation cannot reach it and every SSH session in the sandbox would fail. nono \
+             refuses the combination instead of starting a session with a broken SSH route. \
+             Use one of the two: drop network.allow_ssh, or drop command_policies.commands."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) struct ResolvedTlsInterceptOptions {
@@ -3197,7 +3225,7 @@ pub(crate) fn start_proxy_runtime(
                     network_policy::resolve_ssh_allowances(allow_ssh)?,
                 ),
                 credential: crate::ssh_bastion::credential::resolve(proxy.ssh_key.as_deref())?,
-                default_user: default_remote_user(),
+                default_user: default_remote_user()?,
             },
         )?;
 
@@ -3232,12 +3260,26 @@ fn user_known_hosts_path() -> Result<PathBuf> {
     Ok(home.join(".ssh").join("known_hosts"))
 }
 
-/// Remote user for an allowance that names none, matching what a bare
-/// `ssh host` would send.
-fn default_remote_user() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "root".to_string())
+/// Remote user for an allowance that names none.
+///
+/// OpenSSH resolves `getpwuid(getuid())->pw_name` and has no fallback, so the
+/// mediation resolves the same way instead of reading `USER`, which is unset
+/// under `env -i`, in bare containers, in cron and in systemd units without
+/// `User=`. Guessing there would authenticate the parent's key as an identity
+/// nobody named.
+fn default_remote_user() -> Result<String> {
+    let uid = nix::unistd::geteuid();
+    nix::unistd::User::from_uid(uid)
+        .ok()
+        .flatten()
+        .map(|user| user.name)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            NonoError::ConfigParse(format!(
+                "network.allow_ssh has no remote identity to use: uid {uid} has no name in the \
+                 password database. Name the remote identity as user@host in the allowance."
+            ))
+        })
 }
 
 /// Warn when the caller still grants the agent socket into the sandbox.
@@ -3250,15 +3292,16 @@ fn warn_on_redundant_agent_grant(caps: &CapabilitySet) {
         return;
     };
     let socket = PathBuf::from(socket);
+    let canonical = socket.canonicalize().unwrap_or_else(|_| socket.clone());
     let granted = caps
         .unix_socket_capabilities()
         .iter()
-        .any(|cap| cap.original == socket || cap.resolved == socket);
+        .any(|cap| cap.covers(&socket) || cap.covers(&canonical));
     if granted {
         warn!(
-            "--allow-unix-socket {} is no longer needed with network.allow_ssh: nono \
-             authenticates outside the sandbox. Granting the agent socket lets a sandboxed \
-             process obtain a signature for any host, which is what the mediation prevents.",
+            "Granting the ssh-agent socket {} is no longer needed with network.allow_ssh: nono \
+             authenticates outside the sandbox. A sandboxed process holding the agent can obtain \
+             a signature for any host, which is what the mediation prevents.",
             socket.display()
         );
     }
@@ -3266,24 +3309,27 @@ fn warn_on_redundant_agent_grant(caps: &CapabilitySet) {
 
 /// Grant the sandboxed child connect access to the mediation socket.
 ///
-/// `ConnectBind` rather than `Connect`: the capability is built before the
-/// listener binds, and a `Connect` grant requires the path to exist already.
+/// `Connect` suffices: `ssh_bastion::start` binds the listener before this
+/// runs, so the path already exists and nothing in the sandbox needs the
+/// bind right.
 fn grant_bastion_socket_access(caps: &mut CapabilitySet, socket: &Path) -> Result<()> {
-    let cap = nono::UnixSocketCapability::new_file(socket, nono::UnixSocketMode::ConnectBind)
-        .map_err(|e| {
+    let cap = nono::UnixSocketCapability::new_file(socket, nono::UnixSocketMode::Connect).map_err(
+        |e| {
             NonoError::SandboxInit(format!(
                 "Failed to grant the SSH mediation socket '{}': {e}",
                 socket.display()
             ))
-        })?;
+        },
+    )?;
     caps.add_unix_socket(cap);
     Ok(())
 }
 
-/// Grant the sandboxed child read (and, on Linux, execute) access to the
-/// generated SSH config, known_hosts and wrapper. Mirrors the TLS-intercept
-/// bundle grant: both live under the protected `~/.nono` root, which on macOS
-/// needs action-matching platform rules to override the `file-read-data` deny.
+/// Grant the sandboxed child read access to the generated SSH config,
+/// known_hosts and wrapper, and execute access to the two paths that are
+/// actually executed. Mirrors the TLS-intercept bundle grant: both live under
+/// the protected `~/.nono` root, which on macOS needs action-matching platform
+/// rules to override the `file-read-data` deny.
 ///
 /// `nono_exe` is granted for the same reason: the generated config's
 /// `ProxyCommand` runs that binary, and it is only reachable by accident when
@@ -3297,18 +3343,16 @@ fn grant_ssh_client_access(
     files: &crate::ssh_client::SshClientFiles,
     nono_exe: &std::path::Path,
 ) -> Result<()> {
-    let mut paths = vec![files.config_path(), files.known_hosts_path(), nono_exe];
-    paths.extend(files.wrapper_path());
-    for path in paths {
+    let mut readable = vec![files.config_path(), files.known_hosts_path(), nono_exe];
+    readable.extend(files.wrapper_path());
+    for path in readable {
         #[cfg(target_os = "macos")]
         {
-            let path_str = crate::policy::path_to_utf8(path)?;
-            let escaped = crate::policy::escape_seatbelt_path(path_str)?;
+            let escaped = seatbelt_literal(path)?;
             caps.add_platform_rule(format!("(allow file-read-data (literal \"{escaped}\"))"))?;
             caps.add_platform_rule(format!(
                 "(allow file-read-metadata (literal \"{escaped}\"))"
             ))?;
-            caps.add_platform_rule(format!("(allow process-exec (literal \"{escaped}\"))"))?;
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -3324,7 +3368,24 @@ fn grant_ssh_client_access(
             path.display()
         );
     }
+
+    // The wrapper is a `#!/bin/sh` script, so its grant has to cover
+    // `process-exec-interpreter` too, which only the starred form does.
+    #[cfg(target_os = "macos")]
+    {
+        let mut executable = vec![nono_exe];
+        executable.extend(files.wrapper_path());
+        for path in executable {
+            let escaped = seatbelt_literal(path)?;
+            caps.add_platform_rule(format!("(allow process-exec* (literal \"{escaped}\"))"))?;
+        }
+    }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_literal(path: &std::path::Path) -> Result<String> {
+    crate::policy::escape_seatbelt_path(crate::policy::path_to_utf8(path)?)
 }
 
 fn extend_provider_base_url_env_vars(
@@ -3859,6 +3920,28 @@ mod tests {
         assert!(
             err.to_string().contains("*.example.com"),
             "the error must name the offending entry, got: {err}"
+        );
+    }
+
+    /// A tool-sandboxed child never receives `NONO_SSH_BASTION`, so the two
+    /// together would start a session whose every SSH attempt fails.
+    #[test]
+    fn test_allow_ssh_with_command_policies_is_refused() {
+        let mut proxy = ssh_only_proxy(&["build.example.com"]);
+        reject_ssh_with_command_policies(&proxy).expect("allow_ssh alone stays supported");
+
+        let mut policies = crate::command_policy::CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            crate::command_policy::CommandPolicyConfig::default(),
+        );
+        proxy.command_policies = Some(policies);
+        let err = reject_ssh_with_command_policies(&proxy)
+            .expect_err("the combination has no working route");
+        let message = err.to_string();
+        assert!(
+            message.contains("network.allow_ssh") && message.contains("command_policies"),
+            "the error must name both features, got: {message}"
         );
     }
 

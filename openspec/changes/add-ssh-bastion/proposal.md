@@ -59,13 +59,26 @@ sandbox, and verify the remote host key itself.
   endpoint against the user's `known_hosts` and refuses an unknown or changed
   key. The sandbox is handed a generated `known_hosts` naming only nono's own
   ephemeral per-session host key, so no in-sandbox process can accept a new key.
-- **New:** every channel request is recorded in the existing audit log with the
-  endpoint, request type, and command string.
+- **New:** every channel request is logged with the endpoint, request type, and
+  command string. These are `tracing` records on the network layer's targets,
+  not entries in the structured audit ledger `nono audit` reads; carrying them
+  into that ledger is deferred (see `tasks.md` 7.1).
 - **BREAKING:** `nono ssh-tunnel` and the raw CONNECT route for SSH are
   removed. `allow_ssh` no longer adds `host:port` to the proxy allowlist, so
   `CONNECT host:22` is refused for every host including the allowed one. The
   subcommand is hidden and undocumented; a caller invoking it directly gets an
   unknown-subcommand error.
+
+  The subcommand goes rather than staying as a hidden fallback because a
+  byte-transparent stream to an allowed authority is exactly the capability
+  this change removes: it cannot distinguish `git fetch` from an interactive
+  shell or a port forward, and it is reachable by anything in the sandbox that
+  can execute the nono binary. No user migration is required. The subcommand
+  was only ever referenced by the SSH configuration nono generates, which is
+  regenerated to point at the mediated route. This is recorded here rather than
+  as a `REMOVED Requirement` in the `network/ssh-egress` delta, because that
+  capability never carried a requirement for the tunnel: it specified the
+  route's properties, not its implementation, so there is nothing to remove.
 - **Unchanged:** the port pin (`ssh_endpoints`), the kernel-enforcement refusal
   (`allow_ssh` without the seccomp supervisor fails at startup), the
   `--block-net` and `no_proxy` conflicts, and the generated wrapper and

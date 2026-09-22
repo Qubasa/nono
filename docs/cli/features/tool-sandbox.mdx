@@ -656,14 +656,23 @@ session: the client's session terminates at nono, which authenticates to the
 endpoint itself with `--ssh-key` or the host's `SSH_AUTH_SOCK` and relays only
 `session` channels. It is host- and port-exact, with the port defaulting to 22,
 and it is enforced by the proxy destination pin rather than by Landlock's
-port-only `AccessNet`, so it works the same on macOS and Linux. Granting the
-agent socket into the sandbox as well is redundant, and nono warns about it,
-because an agent the sandbox can reach signs for every key it holds.
+port-only `AccessNet`, so it works the same on macOS and Linux. A
+session-level grant of the agent socket (`--allow-unix-socket
+"$SSH_AUTH_SOCK"`, or `capabilities.unix_sockets` in the profile) is redundant
+once `allow_ssh` is active, and nono warns about that one, because an agent the
+sandbox can reach signs for every key it holds. The warning inspects the
+session capability set only: a Tool Sandbox `local-socket` credential like the
+one above builds a fresh capability set per child at launch, long after that
+check has run, so it is never covered by the warning.
 
-Under Tool Sandbox the generated `ssh` PATH wrapper is not installed, because
-the shim directory owns `ssh` on `PATH`; `GIT_SSH_COMMAND` still points git at
-the generated config, and an `ssh` governed by `command_policies` keeps going
-through its shim.
+`network.allow_ssh` together with `command_policies.commands` is refused before
+the sandbox starts. A tool-sandboxed child is launched into its own environment
+namespace, which strips `NONO_SSH_BASTION` and does not carry
+`GIT_SSH_COMMAND`, so the child has no route to the mediation and every SSH
+session in it would fail. nono refuses the combination rather than starting a
+session with a broken SSH route: drop one or the other. On a profile with no
+`command_policies.commands`, the generated `ssh` PATH wrapper is not installed
+under Tool Sandbox, because the shim directory owns `ssh` on `PATH`.
 
 `path` may reference environment variables, optionally followed by a literal suffix,
 such as `"$XDG_RUNTIME_DIR/sccache.sock"`. Variables are expanded anywhere in 
@@ -671,9 +680,17 @@ the string; if a referenced variable is unset, a command that selects the
 credential fails before launch with a Tool Sandbox error naming the variable.
 
 An agent socket granted this way keeps private keys out of the sandbox, but the
-agent can sign for every key it holds. Under `allow_ssh` there is nothing left
-to narrow: no key file and no agent socket exists inside the sandbox, and the
-endpoint the credential could be used against is fixed by the allowance. See
+agent can sign for every key it holds, for any host the caller names.
+`allow_ssh` does not narrow that. What the mediation bounds is what nono hands
+over: nono never puts a key file or an agent socket in the sandbox itself, and
+the endpoint *nono's own* credential is used against is fixed by the allowance.
+An agent socket the sandbox can reach by some other route (this credential, or
+the host's `SSH_AUTH_SOCK` when `AF_UNIX` is unmediated) is outside that bound,
+and signs for whatever host the client asks about.
+
+To put the host's agent out of reach, set `linux.af_unix_mediation:
+"pathname"`; it is off by default in proxy-only mode, which is the mode
+`allow_ssh` selects. See
 [SSH Egress Pinning](/cli/features/networking#ssh-egress-pinning).
 
 ### Shaping an ambient credential's phantom

@@ -1554,8 +1554,9 @@ pub struct ProxyArgs {
     )]
     pub allow_proxy: Vec<String>,
 
-    /// Allow SSH to one endpoint, as [user@]host[:port] (repeatable).
-    /// Port-exact: it defaults to 22 and no other port on that host is opened.
+    /// Pin one SSH endpoint's port shut, as [user@]host[:port] (repeatable).
+    /// `nono proxy` installs the port pin only. A mediated SSH session needs
+    /// `nono run --allow-ssh`, which runs the bastion the pin routes to.
     #[arg(
         long = "allow-ssh",
         env = "NONO_ALLOW_SSH",
@@ -1563,17 +1564,6 @@ pub struct ProxyArgs {
         help_heading = "NETWORK"
     )]
     pub allow_ssh: Vec<String>,
-
-    /// Private key nono authenticates the SSH mediation with, read in the
-    /// parent before the sandbox starts. Not granted to the sandbox. Without
-    /// it, nono uses the ssh-agent at its own SSH_AUTH_SOCK.
-    #[arg(
-        long = "ssh-key",
-        env = "NONO_SSH_KEY",
-        value_name = "FILE",
-        help_heading = "NETWORK"
-    )]
-    pub ssh_key: Option<PathBuf>,
 
     /// Block a domain through the proxy. Evaluated before the allowlist.
     /// Supports wildcards (e.g. *.ads.example.com).

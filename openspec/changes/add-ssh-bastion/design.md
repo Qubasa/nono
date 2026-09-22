@@ -236,10 +236,13 @@ host` with no command opens a shell and types whatever it likes.
 - **Certificates and `sk-*` keys through the agent.** `russh::keys::agent`
   yields an `AgentIdentity` that is either a plain `PublicKey` or a
   `Certificate`, and the client offers each in turn, so both work over the
-  agent with no extra plumbing. Direct key *files* of either kind do not:
-  `decode_secret_key` refuses a certificate as a parse failure, and a
-  hardware-backed key needs a token nono cannot drive. Both are refused at
-  startup naming `ssh-add` as the remedy, which is what D4 anticipated.
+  agent with no extra plumbing. Direct key *files* of either kind do not, and
+  they fail differently. A hardware-backed key decodes and is then refused by
+  the algorithm check at startup, naming `ssh-add` as the remedy, which is what
+  D4 anticipated. A certificate never reaches that check: it is a separate
+  artifact from the private key, so `decode_secret_key` refuses it as a parse
+  failure and the user is told the file could not be parsed. Both are startup
+  errors, but only the first says "agent".
 
 ## Measured
 
@@ -261,10 +264,12 @@ host` with no command opens a shell and types whatever it likes.
   `linux.af_unix_mediation`, which is off by default in proxy-only mode
   (issue #1901). The specs and `docs/cli/features/networking.mdx` say so
   plainly rather than claim containment the sandbox does not have.
-- **`ssh -L` is refused by the seccomp bind pin, not by the channel policy.**
-  Binding the local listener happens before any channel opens, so the
-  `direct-tcpip` rule never sees it. The rule is still reached - and tested -
-  through `ssh -J`.
+- **`ssh -L` is refused by Landlock's TCP-bind restriction, not by the channel
+  policy.** Binding the local listener happens before any channel opens, so the
+  `direct-tcpip` rule never sees it. The seccomp destination pin is a different
+  control and governs `connect`/`sendto`; the `bind` refusal comes from
+  `AccessNet::BindTcp` (`crates/nono/src/sandbox/linux.rs`). The channel rule
+  is still reached, and tested, through `ssh -J`.
 
 ## Open Questions
 

@@ -281,9 +281,11 @@ impl NonoError {
             | Self::AuditLedgerCorrupt { .. }
             | Self::ObjectStore(_)
             | Self::Snapshot(_) => NonoDiagnosticCode::Other,
-            // Everything the mediation refuses is a network-policy decision:
-            // an endpoint no allowance covers, a request the channel policy
-            // rejects, or a host key the user has not verified.
+            // `SshBastion` is raised only where the mediation refuses: an
+            // endpoint no allowance covers, a request the channel policy
+            // rejects, a command outside the allowlist, or a host key the user
+            // has not verified. Transport and configuration failures on the
+            // same path use `Io` and `ConfigParse`.
             Self::SshBastion(_) => NonoDiagnosticCode::SandboxDeniedNetwork,
             #[cfg(target_os = "linux")]
             Self::Landlock(_) | Self::LandlockPath(_) => NonoDiagnosticCode::SandboxDeniedPath,

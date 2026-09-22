@@ -302,28 +302,45 @@ and MUST apply the same port-exact matching the allowance already defines.
 - **THEN** the connection is refused, consistent with the port exactness the
   allowance already guarantees
 
-### Requirement: Channel activity is auditable
+### Requirement: Channel activity is logged
 
-Every authorization decision the mediation makes MUST be recorded in the audit
-trail nono already writes for network activity: the endpoint, the channel type,
-the request type, the command line where one is present, and whether the request
-was allowed or refused.
+Every authorization decision the mediation makes MUST be recorded in nono's
+diagnostic log: the endpoint, the channel type, the request type, the command
+line where one is present, and whether the request was allowed or refused.
 
 A refusal MUST be distinguishable from a transport failure in the record, so
 that "the policy refused this" and "the connection broke" are not reported the
-same way.
+same way. A refusal a well-behaved client provokes on every run MUST NOT be
+logged at the same severity as one it had no reason to make, so that the
+interesting refusals are not buried.
+
+> **Deferred.** These records are `tracing` events, not entries in the
+> structured audit trail `nono audit` reads and `audit_ledger.rs` drains from
+> `nono_proxy::audit::{log_allowed,log_denied}`. Carrying mediation decisions
+> into that trail, so an allowed `exec` and its command line survive the run
+> as reviewable evidence, is not implemented and is not required by this
+> capability yet. `tasks.md` 7.1 tracks it. Note also that an allowed decision
+> logs at `info`, below the default `warn` filter, so it is invisible without
+> `RUST_LOG`.
 
 #### Scenario: Allowed command is recorded
 
 - **WHEN** a sandboxed process runs a remote command over an allowed endpoint
-- **THEN** the audit trail contains an entry naming the endpoint, the request
-  type, and the command line
+- **THEN** the log contains an entry naming the endpoint, the request type, and
+  the command line
 
 #### Scenario: Refusal is recorded
 
 - **WHEN** a forwarding request is refused
-- **THEN** the audit trail contains an entry naming the endpoint and the refused
-  request type, marked as a policy refusal
+- **THEN** the log contains an entry naming the endpoint and the refused
+  request type, phrased as a policy refusal rather than as a network error
+
+#### Scenario: A routine refusal is not raised to a warning
+
+- **WHEN** a client sends the `env` requests an ordinary `git fetch` sends on
+  every run, and the mediation refuses them
+- **THEN** those refusals are recorded below warning severity, while a refusal
+  the client had no reason to make is recorded at warning severity
 
 ### Requirement: The mediation fails closed
 

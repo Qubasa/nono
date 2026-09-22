@@ -115,9 +115,14 @@
 - [x] 5.3 Propagate exit status, `exit-signal`, and stream separation
       end-to-end; verify a remote command exiting 7 exits 7 locally, and that
       stderr arrives on stderr
-- [x] 5.4 Forward `pty-req` and `window-change` for interactive sessions; verify
+- [ ] 5.4 Forward `pty-req` and `window-change` for interactive sessions; verify
       against a real `sshd` that `stty size` inside the session reports the
-      local terminal size and follows a resize
+      local terminal size and follows a resize.
+      **Half done.** `pty-req` is forwarded and covered by
+      `an_interactive_pty_reports_a_terminal_size`, which runs `stty size`
+      through a forced pty against the fixture `sshd`. The resize half is not
+      tested: nothing drives a `SIGWINCH` at the client, so
+      `window_change_request` is exercised only by the pure policy function.
 
 ## 6. Fail closed
 
@@ -138,11 +143,17 @@
 
 ## 7. Audit and diagnostics
 
-- [x] 7.1 Record each decision in the existing audit log
+- [ ] 7.1 Record each decision in the existing audit log
       (`crates/nono-proxy/src/audit.rs`) with endpoint, channel type, request
       type, command line, and allowed/refused; verify an allowed `exec` and a
       refused `direct-tcpip` both appear with the command line present on the
-      first
+      first.
+      **Not done.** `ssh_bastion::audit` emits `tracing` events only and never
+      calls `nono_proxy::audit::{log_allowed,log_denied}`, so no mediation
+      decision reaches the ledger `audit_ledger.rs` drains or `nono audit`
+      reads. The allowed path is `info!`, below the default `warn` filter, so
+      it is not even in the log by default. The spec requirement is reworded to
+      describe the logging that exists and marks the ledger work deferred.
 - [x] 7.2 Distinguish a policy refusal from a transport failure in both the
       audit record and the user-visible error; verify the refusal text does not
       read as a network error (the `ConfigParse`-vs-`SshTunnel` mistake in
@@ -158,7 +169,12 @@
 - [x] 8.2 Acceptance matrix, one test each: `ssh host cmd` runs; `ssh host`
       interactive runs; `git fetch` over SSH succeeds; `scp`/`sftp` succeed;
       `ssh -L` is refused; `ssh -R` is refused; `ssh -J` is refused;
-      `ssh -A` is refused; a second host on the pinned port is refused
+      `ssh -A` is refused; a second host on the pinned port is refused.
+      Note on `ssh -A`: a plain `-A` never reaches the bastion, because the
+      generated config sets `IdentityAgent none` and OpenSSH then decides it
+      has no agent to forward. The test overrides that with `-o IdentityAgent`
+      on the command line, which is what a sandboxed process would do, and
+      asserts the bastion refuses `auth-agent-req@openssh.com` by name.
 - [x] 8.2b Command allowlist matrix against the same `sshd`, one test each: the
       named command runs; a different command is refused; the named command with
       an extra argument is refused; `ssh host` with no command is refused on a

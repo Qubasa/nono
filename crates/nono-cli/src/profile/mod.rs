@@ -1799,18 +1799,28 @@ pub enum AllowSshEntry {
     /// Endpoint with the default session policy.
     Plain(String),
     /// Endpoint restricted to an exact set of command lines.
-    WithCommands {
-        endpoint: String,
-        #[serde(default)]
-        commands: Vec<String>,
-    },
+    WithCommands(SshCommandAllowance),
+}
+
+/// The object form of an [`AllowSshEntry`].
+///
+/// Unknown keys are refused so that what nono accepts matches what the JSON
+/// schema accepts, and so a misspelled `commands` reads as an unusable entry
+/// rather than as an endpoint that restricts nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshCommandAllowance {
+    pub endpoint: String,
+    #[serde(default)]
+    pub commands: Vec<String>,
 }
 
 impl AllowSshEntry {
     /// The `[user@]host[:port]` endpoint, regardless of variant.
     pub fn endpoint(&self) -> &str {
         match self {
-            Self::Plain(endpoint) | Self::WithCommands { endpoint, .. } => endpoint,
+            Self::Plain(endpoint) => endpoint,
+            Self::WithCommands(allowance) => &allowance.endpoint,
         }
     }
 
@@ -1818,7 +1828,7 @@ impl AllowSshEntry {
     pub fn commands(&self) -> &[String] {
         match self {
             Self::Plain(_) => &[],
-            Self::WithCommands { commands, .. } => commands,
+            Self::WithCommands(allowance) => &allowance.commands,
         }
     }
 
@@ -1826,8 +1836,8 @@ impl AllowSshEntry {
     pub fn display(&self) -> String {
         match self {
             Self::Plain(endpoint) => endpoint.clone(),
-            Self::WithCommands { endpoint, commands } => {
-                format!("{endpoint} [{}]", commands.join(", "))
+            Self::WithCommands(allowance) => {
+                format!("{} [{}]", allowance.endpoint, allowance.commands.join(", "))
             }
         }
     }
@@ -3848,7 +3858,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.network.allow_domain,
                 &child.network.allow_domain,
             ),
-            allow_ssh: dedup_append(&base.network.allow_ssh, &child.network.allow_ssh),
+            allow_ssh: merge_allow_ssh(&base.network.allow_ssh, &child.network.allow_ssh),
             deny_domain: dedup_append(&base.network.deny_domain, &child.network.deny_domain),
             open_port: dedup_append(&base.network.open_port, &child.network.open_port),
             open_port_range: dedup_append(
@@ -4033,6 +4043,45 @@ pub(crate) fn dedup_append<T: Eq + std::hash::Hash + Clone>(base: &[T], child: &
         }
     }
     result
+}
+
+/// Merge `allow_ssh` entries from base and child profiles.
+///
+/// For the same endpoint, command lists are **unioned** and a plain entry
+/// beside a restricted one becomes restricted, so a child naming commands on
+/// an endpoint the base left open narrows it instead of being shadowed by the
+/// base entry. Order: base endpoints first, then child-only endpoints.
+pub(crate) fn merge_allow_ssh(
+    base: &[AllowSshEntry],
+    child: &[AllowSshEntry],
+) -> Vec<AllowSshEntry> {
+    let mut endpoints: Vec<String> = Vec::new();
+    let mut commands: HashMap<String, Vec<String>> = HashMap::new();
+
+    for entry in base.iter().chain(child.iter()) {
+        let endpoint = entry.endpoint();
+        if !endpoints.iter().any(|known| known == endpoint) {
+            endpoints.push(endpoint.to_string());
+        }
+        let allowed = commands.entry(endpoint.to_string()).or_default();
+        for command in entry.commands() {
+            if !allowed.contains(command) {
+                allowed.push(command.clone());
+            }
+        }
+    }
+
+    endpoints
+        .into_iter()
+        .map(|endpoint| {
+            let commands = commands.remove(&endpoint).unwrap_or_default();
+            if commands.is_empty() {
+                AllowSshEntry::Plain(endpoint)
+            } else {
+                AllowSshEntry::WithCommands(SshCommandAllowance { endpoint, commands })
+            }
+        })
+        .collect()
 }
 
 /// Merge `allow_domain` entries from base and child profiles.
@@ -7124,6 +7173,18 @@ mod tests {
         );
     }
 
+    /// A child narrowing an inherited endpoint to a command list used to be
+    /// shadowed by the base's plain entry, which left the endpoint open.
+    #[test]
+    fn merging_allow_ssh_narrows_an_inherited_endpoint() {
+        let base = vec![AllowSshEntry::Plain("build.example.com".to_string())];
+        let child = vec![AllowSshEntry::WithCommands(SshCommandAllowance {
+            endpoint: "build.example.com".to_string(),
+            commands: vec!["git-upload-pack /srv/repo.git".to_string()],
+        })];
+        assert_eq!(merge_allow_ssh(&base, &child), child);
+    }
+
     #[test]
     fn test_profile_parses_linux_af_unix_mediation() {
         let json = r#"{
@@ -8847,6 +8908,24 @@ mod tests {
                 "error for '{entry}' must name the entry, got: {err}"
             );
         }
+    }
+
+    /// The JSON schema refuses an unknown key in the object form. An untagged
+    /// struct variant would ignore it, so CI and nono would disagree on which
+    /// profiles are loadable.
+    #[test]
+    fn test_network_allow_ssh_object_form_rejects_unknown_keys() {
+        parse_profile_bytes(
+            br#"{
+                "meta": { "name": "bad-ssh-object" },
+                "network": {
+                    "allow_ssh": [
+                        { "endpoint": "build.example.com", "commands": ["uptime"], "junk": 1 }
+                    ]
+                }
+            }"#,
+        )
+        .expect_err("an unknown key must be refused at load time");
     }
 
     /// An SSH host in `no_proxy` would hand the sandbox a route the

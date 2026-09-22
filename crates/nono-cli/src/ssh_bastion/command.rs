@@ -15,6 +15,8 @@
 
 use std::str::from_utf8;
 
+use super::escape_for_display;
+
 /// Outcome of checking a requested command against an allowance's list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CommandDecision {
@@ -36,7 +38,7 @@ pub(crate) fn command_matches(rules: &[String], requested: &[u8]) -> CommandDeci
         Err(_) => {
             return CommandDecision::Refused(format!(
                 "network.allow_ssh refused the remote command `{}`: it is not valid UTF-8, so it cannot be tokenised or matched against this endpoint's allowed commands",
-                display_command(&String::from_utf8_lossy(requested))
+                escape_for_display(&String::from_utf8_lossy(requested))
             ));
         }
     };
@@ -44,7 +46,7 @@ pub(crate) fn command_matches(rules: &[String], requested: &[u8]) -> CommandDeci
     if let Some(found) = requested.chars().find(|ch| METACHARACTERS.contains(ch)) {
         return CommandDecision::Refused(format!(
             "network.allow_ssh refused the remote command `{}`: it contains the shell metacharacter {}, one of the separators, pipes, redirections, substitutions and newlines that nono cannot evaluate because the remote shell is what interprets the command line",
-            display_command(requested),
+            escape_for_display(requested),
             name_metacharacter(found)
         ));
     }
@@ -52,27 +54,27 @@ pub(crate) fn command_matches(rules: &[String], requested: &[u8]) -> CommandDeci
     let Some(requested_argv) = shlex::split(requested) else {
         return CommandDecision::Refused(format!(
             "network.allow_ssh refused the remote command `{}`: it does not tokenise as a POSIX command line, so it cannot be compared with this endpoint's allowed commands",
-            display_command(requested)
+            escape_for_display(requested)
         ));
     };
 
     if rules.is_empty() {
         return CommandDecision::Refused(format!(
             "network.allow_ssh refused the remote command `{}`: this endpoint's allowance names no commands at all",
-            display_command(requested)
+            escape_for_display(requested)
         ));
     }
 
     for rule in rules {
-        let rule_argv = match shlex::split(rule) {
-            Some(argv) if !argv.is_empty() => argv,
-            _ => {
-                return CommandDecision::Refused(format!(
-                    "network.allow_ssh refused the remote command `{}`: the allowed command `{}` does not tokenise as a POSIX command line, so it can never match anything",
-                    display_command(requested),
-                    display_command(rule)
-                ));
-            }
+        let Some(rule_argv) = shlex::split(rule).filter(|argv| !argv.is_empty()) else {
+            // One malformed rule is not the endpoint's whole allowance. It is
+            // also rejected at startup, so this is the belt to that braces.
+            tracing::warn!(
+                "network.allow_ssh skipped the allowed command `{}`: it does not tokenise as a \
+                 POSIX command line, so it can never match anything",
+                escape_for_display(rule)
+            );
+            continue;
         };
         if rule_argv == requested_argv {
             return CommandDecision::Allowed;
@@ -81,9 +83,20 @@ pub(crate) fn command_matches(rules: &[String], requested: &[u8]) -> CommandDeci
 
     CommandDecision::Refused(format!(
         "network.allow_ssh refused the remote command `{}`: this endpoint's allowance names {}, and a command matches only when its whole argument vector is identical",
-        display_command(requested),
+        escape_for_display(requested),
         command_list(rules)
     ))
+}
+
+/// Whether an allowance's command entry can ever match a request.
+///
+/// Two ways an entry is dead on arrival: it does not tokenise, or it carries a
+/// metacharacter, which every request carrying one is refused for before
+/// matching is attempted. Startup is where a dead entry should be named, not
+/// the first session that fails to use it.
+pub(crate) fn rule_is_matchable(rule: &str) -> bool {
+    !rule.chars().any(|ch| METACHARACTERS.contains(&ch))
+        && shlex::split(rule).is_some_and(|argv| !argv.is_empty())
 }
 
 /// Render an allowance's command list for a refusal message.
@@ -97,7 +110,7 @@ pub(crate) fn command_list(rules: &[String]) -> String {
             out.push_str(", ");
         }
         out.push('`');
-        out.push_str(&display_command(rule));
+        out.push_str(&escape_for_display(rule));
         out.push('`');
     }
     out
@@ -109,21 +122,6 @@ fn name_metacharacter(found: char) -> String {
         '\r' => "a carriage return".to_string(),
         other => format!("`{other}`"),
     }
-}
-
-/// Keep a refused command readable on one line: a refusal names the command,
-/// and a raw newline or control byte in it would otherwise reshape the message
-/// the user reads.
-fn display_command(command: &str) -> String {
-    let mut out = String::with_capacity(command.len());
-    for ch in command.chars() {
-        if ch.is_control() {
-            out.extend(ch.escape_debug());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -223,10 +221,37 @@ mod tests {
     }
 
     #[test]
-    fn an_unusable_rule_matches_nothing() {
-        let rules = rules(&["git-upload-pack 'unterminated"]);
-        let reason = refusal(command_matches(&rules, b"git-upload-pack /srv/repo.git"));
-        assert!(reason.contains("can never match"), "{reason}");
+    fn an_unusable_rule_costs_only_itself() {
+        let rules = rules(&["deploy --to 'prod", "git-upload-pack /srv/repo.git"]);
+        assert_eq!(
+            command_matches(&rules, b"git-upload-pack /srv/repo.git"),
+            CommandDecision::Allowed
+        );
+        let reason = refusal(command_matches(&rules, b"deploy --to prod"));
+        assert!(reason.contains("deploy --to prod"), "{reason}");
+    }
+
+    /// What startup calls dead and what a session refuses have to be the same
+    /// set, or an allowance passes validation and still matches nothing.
+    #[test]
+    fn an_unmatchable_rule_is_exactly_one_that_never_matches_itself() {
+        for dead in ["deploy --to 'prod", "make build && deploy", "", "   "] {
+            assert!(!rule_is_matchable(dead), "{dead}");
+            let rules = rules(&[dead]);
+            assert_ne!(
+                command_matches(&rules, dead.as_bytes()),
+                CommandDecision::Allowed,
+                "{dead}"
+            );
+        }
+        for live in ["git-upload-pack /srv/repo.git", "deploy --to 'prod host'"] {
+            assert!(rule_is_matchable(live), "{live}");
+            assert_eq!(
+                command_matches(&rules(&[live]), live.as_bytes()),
+                CommandDecision::Allowed,
+                "{live}"
+            );
+        }
     }
 
     #[test]

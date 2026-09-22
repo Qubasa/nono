@@ -493,10 +493,9 @@ fn validate_ssh_user(user: &str) -> std::result::Result<String, String> {
     if user.is_empty() {
         return Err("user name is empty".to_string());
     }
-    if user
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | ':'))
-    {
+    if user.chars().any(|c| {
+        c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | ':' | '@' | '[' | ']')
+    }) {
         return Err("user name contains a character that cannot appear in a user name".to_string());
     }
     Ok(user.to_string())
@@ -550,25 +549,58 @@ pub struct ResolvedSshAllowance {
 ///
 /// # Errors
 ///
-/// Propagates the first [`parse_ssh_endpoint`] failure, and rejects an object
-/// entry whose `commands` list is empty.
+/// Propagates the first [`parse_ssh_endpoint`] failure, rejects an object
+/// entry whose `commands` list is empty or carries a command that does not
+/// tokenise, and rejects a repeated authority.
 pub fn resolve_ssh_allowances(entries: &[AllowSshEntry]) -> Result<Vec<ResolvedSshAllowance>> {
     let mut result = Vec::with_capacity(entries.len());
+    let mut seen: Vec<String> = Vec::with_capacity(entries.len());
     for entry in entries {
         let endpoint = parse_ssh_endpoint(entry.endpoint())?;
-        if matches!(entry, AllowSshEntry::WithCommands { .. }) && entry.commands().is_empty() {
+        if matches!(entry, AllowSshEntry::WithCommands(_)) && entry.commands().is_empty() {
             return Err(NonoError::ConfigParse(format!(
                 "SSH endpoint '{}' names an empty command list: drop the 'commands' key to \
                  keep the default session policy, or name the commands that may run",
                 entry.endpoint()
             )));
         }
+        validate_ssh_commands(entry.endpoint(), entry.commands())?;
+        let authority = ssh_endpoint_authority(&endpoint.host, endpoint.port);
+        if seen.contains(&authority) {
+            return Err(NonoError::ConfigParse(format!(
+                "SSH endpoint '{}' is allowed twice, both times as {authority}: the first \
+                 entry would decide the remote user and the command policy and the later one \
+                 would silently do nothing, so a repeat meant to narrow the endpoint would \
+                 not narrow it. Name each host and port once, carrying the user prefix and \
+                 the commands that endpoint may run",
+                entry.endpoint()
+            )));
+        }
+        seen.push(authority);
         result.push(ResolvedSshAllowance {
             endpoint,
             commands: entry.commands().to_vec(),
         });
     }
     Ok(result)
+}
+
+/// Reject an allowed command that could never match a request.
+///
+/// A rule that cannot match is skipped at match time, so one typo would leave
+/// the endpoint quietly allowing the rest of the list and nothing else.
+fn validate_ssh_commands(endpoint: &str, commands: &[String]) -> Result<()> {
+    for command in commands {
+        if !crate::ssh_bastion::command::rule_is_matchable(command) {
+            return Err(NonoError::ConfigParse(format!(
+                "SSH endpoint '{endpoint}' names the command '{command}', which can never \
+                 match a request: it does not tokenise as a POSIX command line, or it \
+                 carries a shell metacharacter nono refuses before matching. Fix the \
+                 quoting, or drop the entry"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Parse `allow_ssh` entries into the port-exact authorities the proxy pins.
@@ -718,6 +750,13 @@ mod tests {
             .collect()
     }
 
+    fn restricted(endpoint: &str, commands: &[&str]) -> AllowSshEntry {
+        AllowSshEntry::WithCommands(crate::profile::SshCommandAllowance {
+            endpoint: endpoint.to_string(),
+            commands: commands.iter().map(|c| (*c).to_string()).collect(),
+        })
+    }
+
     #[test]
     fn parse_ssh_endpoint_keeps_the_user_it_was_given() {
         assert_eq!(
@@ -748,6 +787,7 @@ mod tests {
             "build.example.com:65536",
             "build.example.com:ssh",
             "::1",
+            "a@b@build.example.com",
         ] {
             let err = parse_ssh_endpoint(entry)
                 .expect_err("entry must be rejected")
@@ -783,27 +823,45 @@ mod tests {
 
     #[test]
     fn an_object_entry_with_no_commands_is_refused() {
-        let err = resolve_ssh_allowances(&[AllowSshEntry::WithCommands {
-            endpoint: "build.example.com".to_string(),
-            commands: Vec::new(),
-        }])
-        .expect_err("an empty command list must be refused")
-        .to_string();
+        let err = resolve_ssh_allowances(&[restricted("build.example.com", &[])])
+            .expect_err("an empty command list must be refused")
+            .to_string();
         assert!(
             err.contains("build.example.com") && err.contains("empty command list"),
             "the refusal must name the entry: {err}"
         );
     }
 
+    /// A repeated authority used to be first-match-wins, so a later entry
+    /// restricting an endpoint the earlier one left open did nothing at all.
     #[test]
-    fn an_object_entry_carries_its_commands() {
-        let resolved = resolve_ssh_allowances(&[AllowSshEntry::WithCommands {
-            endpoint: "git@build.example.com".to_string(),
-            commands: vec!["git-upload-pack /srv/repo.git".to_string()],
-        }])
-        .expect("a populated command list resolves");
-        assert_eq!(resolved[0].endpoint.user.as_deref(), Some("git"));
-        assert_eq!(resolved[0].commands, vec!["git-upload-pack /srv/repo.git"]);
+    fn a_repeated_authority_is_refused() {
+        let err = resolve_ssh_allowances(&[
+            AllowSshEntry::Plain("build.example.com".to_string()),
+            restricted("build.example.com:22", &["git-upload-pack /srv/repo.git"]),
+        ])
+        .expect_err("the same endpoint named twice must be refused")
+        .to_string();
+        assert!(
+            err.contains("build.example.com:22"),
+            "the refusal must name the repeated authority: {err}"
+        );
+    }
+
+    /// A rule that cannot match is skipped at match time, so an unclosed quote
+    /// in one entry would quietly shrink the list to the rest of it.
+    #[test]
+    fn a_command_that_could_never_match_is_refused() {
+        let err = resolve_ssh_allowances(&[restricted(
+            "build.example.com",
+            &["deploy --to 'prod", "git-upload-pack /srv/repo.git"],
+        )])
+        .expect_err("an unmatchable command must be refused")
+        .to_string();
+        assert!(
+            err.contains("deploy --to 'prod"),
+            "the refusal must name the command: {err}"
+        );
     }
 
     #[test]

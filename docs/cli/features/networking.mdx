@@ -194,13 +194,13 @@ The `user@` prefix names the remote user **nono** authenticates as. `--allow-ssh
 | `allow_ssh` | Authorizes a mediated SSH session to `build.example.com:22`, and closes port 22 on every other host. Other ports are untouched, and the endpoint itself is not reachable as raw TCP. |
 | `allow_domain` | Grants the host on every port - any `:port` suffix is stripped, with a warning that the port is ignored. |
 
-Two different refusals report this. `nono why --host other.example.com --port 22` reports `ssh_port_pinned` and names the endpoints the port is pinned to. `nono why --host build.example.com --port 443`, on a policy that is already filtering, reports `port_not_allowed` and names the port the host is allowed on. Configured endpoints appear in `nono profile show`, `nono profile show --json` (key `allow_ssh` under `network`), `nono profile diff` (also with `--json`), and `nono why --self`.
+Three different refusals report this. `nono why --host other.example.com --port 22` reports `ssh_port_pinned` and names the endpoints the port is pinned to. `nono why --host build.example.com --port 22`, for the allowed endpoint itself, reports `ssh_mediated_only`: the port is reachable through the mediated session and not as raw TCP, so the pin closes it on the allowed host too. `nono why --host build.example.com --port 443`, on a policy that is already filtering, reports `proxy_filtered`, because an SSH allowance puts nothing in the proxy allowlist and the host is not otherwise allowed. Configured endpoints appear in `nono profile show`, `nono profile show --json` (key `allow_ssh` under `network`), `nono profile diff` (also with `--json`), and `nono why --self`.
 
-Across profile inheritance, `allow_ssh` entries are appended and deduplicated, the same as `deny_domain` and `no_proxy`.
+Across profile inheritance, `allow_ssh` merges like `allow_domain` rather than being a flat append: entries are keyed by endpoint, base order first and child-only endpoints after, and command lists for the same endpoint are unioned. A plain entry beside a restricted one for the same endpoint becomes restricted, so a child profile narrowing an inherited endpoint to a command list actually narrows it. Naming the same `host:port` twice in one effective list is a load error, including when a `--allow-ssh` flag repeats an endpoint the profile already names, or when two entries differ only in their `user@` prefix: there is one remote identity per endpoint and nono will not pick silently.
 
 #### What the Session May Do
 
-nono authorizes every channel and every channel request on its own. A `session` channel is relayed, and inside it `shell`, `exec`, `pty-req`, `window-change`, `subsystem` and `signal` run on the remote host.
+nono authorizes every channel and every channel request on its own. A `session` channel is relayed, and inside it `shell`, `exec`, `pty-req`, `window-change`, `subsystem` and `signal` run on the remote host. An `env` request is the one ordinary thing that does not travel: the variable is dropped rather than forwarded, so `SendEnv` sets nothing on the remote side and a remote `$LANG` stays at whatever the server's own default is. `TERM` is unaffected, because it travels inside `pty-req`.
 
 Everything that would turn the session into a transport is refused, and the refusal names the request type:
 
@@ -213,7 +213,7 @@ Everything that would turn the session into a transport is refused, and the refu
 
 A refusal arrives as a failed channel request, not as a broken connection, so a command or shell already running in the same session keeps running. A channel type or channel request nono does not recognise is refused rather than forwarded to the remote host.
 
-Two layers can refuse the same flag, and which one speaks first depends on the flag. `ssh -L` usually never reaches the bastion at all: binding the local listener is itself a sandboxed operation, so the seccomp port pin refuses it with `bind: Permission denied` before any channel is opened. `ssh -J` reaches the `direct-tcpip` rule and is refused there. Either way the answer is no; only the wording differs.
+Two layers can refuse the same flag, and which one speaks first depends on the flag. `ssh -L` usually never reaches the bastion at all: binding the local listener is itself a sandboxed operation, and Landlock's `AccessNet::BindTcp` restriction refuses it with `bind: Permission denied` before any channel is opened. The seccomp destination pin is a different control, and governs `connect`/`sendto` rather than `bind`. `ssh -J` reaches the `direct-tcpip` rule and is refused there. Either way the answer is no, and only the wording differs.
 
 `sftp`, `scp` and `rsync -e ssh` keep working, because each one is a subsystem or a remote command inside a session channel.
 
@@ -235,7 +235,7 @@ An entry written as an object names the exact commands its endpoint may run:
 
 Matching is exact on the tokenised argument vector, after quote-aware POSIX word splitting of both the rule and the request. `git-upload-pack '/srv/repo.git'` and `git-upload-pack /srv/repo.git` are therefore the same rule, which matters because OpenSSH's Git integration quotes the repository path and a plain `ssh host cmd` does not. There is no prefix matching, no globbing and no argument templating: a rule covers that command with those arguments and nothing else.
 
-A requested command carrying shell metacharacters (`;`, `|`, `&`, `$`, a backtick, `(`, `)`, `<`, `>`, `{`, `}`, or a newline) is refused before matching is attempted, whether or not the list would otherwise permit it. Those characters are interpreted by the remote shell, and nono cannot evaluate them.
+A requested command carrying shell metacharacters (`;`, `|`, `&`, `$`, a backtick, `(`, `)`, `<`, `>`, `{`, `}`, a newline, or a carriage return) is refused before matching is attempted, whether or not the list would otherwise permit it. Those characters are interpreted by the remote shell, and nono cannot evaluate them. The carriage return is in that set for the same reason as the newline, so a command list authored with CRLF line endings is refused rather than matched against a token carrying a stray `\r`.
 
 An endpoint that carries a command list is a task endpoint, not a login: `shell`, `pty-req` and `subsystem` are refused there, because an interactive shell would run the commands the list just refused. An empty `commands` list is a load error, since it reads as either "no restriction" or "nothing may run". An entry with no command list keeps the default session behavior.
 
@@ -285,6 +285,7 @@ Each of these is refused before the sandbox starts:
 | `--allow-net` with `--allow-ssh` | `--allow-net` bypasses the proxy entirely, so the destination pin could not apply. |
 | A host in both `allow_ssh` and `network.no_proxy` | `no_proxy` tells clients to go direct for that host, and there is no direct route: the endpoint is reachable only through the mediated session. |
 | Any configuration where the seccomp-notify supervisor is not installed | The supervisor is the destination pin. This covers `linux.sandbox_policy` of `landlock` or `external`, and WSL2, where seccomp notify returns `EBUSY`. Landlock filters by port only, so the "just this endpoint" allowance could not be kernel-enforced. |
+| `command_policies.commands` (Tool Sandbox) with `allow_ssh` | A tool-sandboxed child does not inherit nono's environment namespace, so `NONO_SSH_BASTION` is stripped and `GIT_SSH_COMMAND` is not on the allowed list. The child would have no route to the mediation and every SSH session in it would fail, so nono refuses the combination rather than starting with a broken SSH route. |
 
 The refusal is keyed off whether the pin will actually be installed, not off a list of policy names, so `allow_ssh` on WSL2 is rejected outright rather than degrading through `security.wsl2_proxy_policy`. See [Credential Proxy on WSL2](/cli/internals/wsl2#credential-proxy-on-wsl2).
 

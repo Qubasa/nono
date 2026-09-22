@@ -96,6 +96,12 @@ pub(crate) fn prepare_ssh_client_files(nono_exe: &Path) -> Result<SshClientFiles
         .unwrap_or(0);
     let root = base.join(format!("ssh-{pid}-{nanos:09}"));
     create_private_dir(&root)?;
+    // Nothing else sweeps this tree, and a leftover directory makes every
+    // later launch fail in `write_new`. Armed until `SshClientFiles` takes
+    // over cleanup.
+    let cleanup = DirGuard {
+        dir: Some(root.clone()),
+    };
 
     let config_path = root.join("config");
     let bin_dir = root.join("bin");
@@ -157,6 +163,7 @@ pub(crate) fn prepare_ssh_client_files(nono_exe: &Path) -> Result<SshClientFiles
         None => None,
     };
 
+    cleanup.disarm();
     Ok(SshClientFiles {
         root,
         config_path,
@@ -166,6 +173,32 @@ pub(crate) fn prepare_ssh_client_files(nono_exe: &Path) -> Result<SshClientFiles
         socket_path,
         host_key,
     })
+}
+
+/// Removes a partially built session dir when construction fails part-way.
+struct DirGuard {
+    dir: Option<PathBuf>,
+}
+
+impl DirGuard {
+    fn disarm(mut self) {
+        self.dir = None;
+    }
+}
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let Some(dir) = self.dir.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let bin_dir = dir.join("bin");
+            let _ = std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// First `ssh` on the host `PATH`. Resolved here, before the wrapper dir is

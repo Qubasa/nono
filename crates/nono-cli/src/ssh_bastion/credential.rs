@@ -8,14 +8,17 @@
 use nono::{NonoError, Result};
 use russh::keys::{PrivateKey, ssh_key};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Where the bastion gets a signature.
 #[derive(Debug, Clone)]
 pub(crate) enum SshCredential {
     /// The host's agent, reached on this socket path. The agent holds the key.
     Agent(PathBuf),
-    /// A key file nono read and parsed itself.
-    Key(Box<PrivateKey>),
+    /// A key file nono read and parsed itself. Shared rather than copied: a
+    /// session is opened per sandboxed connection, and `ssh-key` does not
+    /// zeroize what a copy leaves behind.
+    Key(Arc<PrivateKey>),
 }
 
 impl SshCredential {
@@ -51,7 +54,7 @@ pub(crate) fn resolve(key_file: Option<&Path>) -> Result<SshCredential> {
 fn resolve_agent() -> Result<SshCredential> {
     let raw = std::env::var_os(AGENT_SOCK_ENV).filter(|value| !value.is_empty());
     let Some(raw) = raw else {
-        return Err(NonoError::SshBastion(format!(
+        return Err(NonoError::ConfigParse(format!(
             "network.allow_ssh needs a credential to authenticate with, and there is none: \
              {AGENT_SOCK_ENV} is not set in nono's own environment.\n\n\
              Start an ssh-agent and add the key, or name one with --ssh-key FILE. \
@@ -60,7 +63,7 @@ fn resolve_agent() -> Result<SshCredential> {
     };
     let path = PathBuf::from(raw);
     if !path.exists() {
-        return Err(NonoError::SshBastion(format!(
+        return Err(NonoError::ConfigParse(format!(
             "network.allow_ssh cannot use the ssh-agent: {AGENT_SOCK_ENV} names '{}', \
              which does not exist",
             path.display()
@@ -76,16 +79,16 @@ fn resolve_agent() -> Result<SshCredential> {
 /// than a clear refusal.
 fn load_key(path: &Path) -> Result<SshCredential> {
     let text = std::fs::read_to_string(path).map_err(|err| {
-        NonoError::SshBastion(format!(
-            "--ssh-key '{}' could not be read: {err}",
-            path.display()
+        NonoError::Io(std::io::Error::new(
+            err.kind(),
+            format!("--ssh-key '{}' could not be read: {err}", path.display()),
         ))
     })?;
 
     let key = match russh::keys::decode_secret_key(&text, None) {
         Ok(key) => key,
         Err(russh::keys::Error::KeyIsEncrypted) => {
-            return Err(NonoError::SshBastion(format!(
+            return Err(NonoError::ConfigParse(format!(
                 "--ssh-key '{}' is encrypted, and nono will not prompt for a passphrase \
                  while a sandbox is starting.\n\n\
                  Add it to your agent instead:  ssh-add {}",
@@ -94,7 +97,7 @@ fn load_key(path: &Path) -> Result<SshCredential> {
             )));
         }
         Err(err) => {
-            return Err(NonoError::SshBastion(format!(
+            return Err(NonoError::ConfigParse(format!(
                 "--ssh-key '{}' could not be parsed: {err}",
                 path.display()
             )));
@@ -102,7 +105,7 @@ fn load_key(path: &Path) -> Result<SshCredential> {
     };
 
     reject_unusable_algorithm(path, &key)?;
-    Ok(SshCredential::Key(Box::new(key)))
+    Ok(SshCredential::Key(Arc::new(key)))
 }
 
 /// Refuse key types the outbound leg cannot drive from a file.
@@ -117,7 +120,7 @@ fn reject_unusable_algorithm(path: &Path, key: &PrivateKey) -> Result<()> {
         ssh_key::Algorithm::SkEcdsaSha2NistP256 | ssh_key::Algorithm::SkEd25519
     );
     if hardware_backed {
-        return Err(NonoError::SshBastion(format!(
+        return Err(NonoError::ConfigParse(format!(
             "--ssh-key '{}' is a hardware-backed key ({}), which nono cannot use from a file \
              because signing needs the security key itself.\n\n\
              Add it to your agent instead:  ssh-add -K",
@@ -201,6 +204,39 @@ mod tests {
         assert!(
             err.contains("could not be parsed"),
             "expected a parse failure, got: {err}"
+        );
+    }
+
+    /// The gate is a two-variant `matches!` over an enum `ssh-key` extends, so
+    /// a third `Sk*` variant would disable it without a word.
+    #[test]
+    fn a_security_key_names_the_agent_as_the_remedy() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)
+            .expect("generate key");
+        let ssh_key::public::KeyData::Ed25519(public) = seed.public_key().key_data() else {
+            panic!("a generated ed25519 key has ed25519 public key data");
+        };
+        let keypair = ssh_key::private::SkEd25519::new(
+            ssh_key::public::SkEd25519::new(*public, "ssh:"),
+            0,
+            b"key-handle".to_vec(),
+        )
+        .expect("build an sk-ssh-ed25519 keypair");
+        let key = PrivateKey::new(
+            ssh_key::private::KeypairData::SkEd25519(keypair),
+            "security key",
+        )
+        .expect("build an sk-ssh-ed25519 private key");
+        let pem = key.to_openssh(ssh_key::LineEnding::LF).expect("encode key");
+        let path = write_key(dir.path(), "id_sk_ed25519", &pem);
+
+        let err = resolve(Some(&path))
+            .expect_err("a security key must not be usable from a file")
+            .to_string();
+        assert!(
+            err.contains("ssh-add -K"),
+            "the refusal must name the agent as the remedy: {err}"
         );
     }
 }

@@ -403,7 +403,7 @@ The route is a mediated SSH session, not a tunnel. The sandboxed client speaks S
 
 Only `session` channels run, which means `shell`, `exec`, `pty-req`, `window-change`, `subsystem` and `signal`. Every forwarding request is refused with the request type named: `direct-tcpip` (`-L`, `-D`, `-J`), `tcpip-forward` (`-R`), `auth-agent-req@openssh.com` (`-A`) and `x11-req` (`-X`, `-Y`). `sftp`, `scp` and `rsync -e ssh` keep working, because each is a subsystem or a remote command.
 
-The `user@` prefix names the remote user nono authenticates as; without one, nono uses the username it runs as, exactly as a plain `ssh host` would. The sandbox does not choose the remote identity, so under `--allow-ssh deploy@build.example.com` a sandboxed `ssh root@build.example.com` still runs as `deploy`.
+The `user@` prefix names the remote user nono authenticates as; without one, nono uses the account name of the uid it runs as, exactly as a plain `ssh host` would. The sandbox does not choose the remote identity, so under `--allow-ssh deploy@build.example.com` a sandboxed `ssh root@build.example.com` still runs as `deploy`. If that uid has no account name, startup fails and the error asks for an explicit `user@` in the allowance rather than guessing.
 
 nono authenticates from outside the sandbox, with `--ssh-key` or the host's `SSH_AUTH_SOCK`, and checks the endpoint's host key against your `~/.ssh/known_hosts` itself. The sandbox needs no grant for a key file or an agent socket.
 
@@ -420,7 +420,7 @@ nono run --allow-cwd --allow-ssh deploy@other.example.com:2222 \
 
 In a profile an entry may instead be an object carrying a `commands` list, which restricts that endpoint to those exact command lines and refuses `shell`, `pty-req` and `subsystem` there. See [Per-Endpoint Command Allowlist](/cli/features/networking#per-endpoint-command-allowlist).
 
-Wildcards (`*.example.com`), an empty host, and a port outside 1–65535 are rejected. Incompatible with `--block-net` and `--allow-net`, both of which remove the proxy that pins the destination. Also accepted by `nono shell`, `nono proxy`, and `nono why`. See [SSH Egress Pinning](/cli/features/networking#ssh-egress-pinning).
+Wildcards (`*.example.com`), an empty host, and a port outside 1–65535 are rejected. Incompatible with `--block-net`, with `--allow-net`, and with a Tool Sandbox profile carrying `command_policies.commands`. Also accepted by `nono shell`, `nono why`, and `nono proxy` — but `nono proxy` has no sandboxed child to mediate for, so there it installs the port pin only; a mediated session needs `nono run` or `nono shell`. See [SSH Egress Pinning](/cli/features/networking#ssh-egress-pinning).
 
 Environment variable: `NONO_ALLOW_SSH`
 
@@ -433,7 +433,7 @@ nono run --allow-cwd --allow-ssh git@build.example.com \
   --ssh-key ~/.ssh/id_build -- git fetch
 ```
 
-An encrypted key file, a hardware-backed `sk-*` key, or a certificate file fails at startup with an error naming the file and pointing at `ssh-add`, rather than prompting for a passphrase or failing mid-session. The flag applies only to endpoints allowed with `--allow-ssh`.
+An encrypted key file or a hardware-backed `sk-*` key fails at startup with an error naming the file and pointing at `ssh-add`, rather than prompting for a passphrase or failing mid-session. A certificate file also fails at startup, but with a parse error: a certificate is a separate artifact from the private key it belongs to, so it never reaches the key-type check. Put a certificate in your agent, which nono offers alongside the plain keys it holds. The flag applies only to endpoints allowed with `--allow-ssh`, and only where there is a mediated session to authenticate: `nono run`, `nono shell` and `nono wrap` take it, `nono proxy` does not.
 
 Environment variable: `NONO_SSH_KEY`
 

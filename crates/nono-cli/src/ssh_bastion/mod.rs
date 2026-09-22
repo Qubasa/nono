@@ -38,8 +38,10 @@ use nono::{NonoError, Result};
 use policy::{EndpointRule, RefusedRequest};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 
 pub(crate) use credential::{AGENT_SOCK_ENV, SshCredential};
 
@@ -56,6 +58,45 @@ pub(crate) const DENIED_REPLY: &str = "NONO-SSH-DENIED";
 /// Upper bound on the preamble line, so a client that never sends a newline
 /// cannot make the parent buffer without limit.
 const PREAMBLE_LIMIT: usize = 512;
+/// How long the sandbox-facing leg tolerates silence before giving up.
+///
+/// It is also the deadline russh applies to reading the client's SSH
+/// identification banner, which is why it is set rather than left at `None`:
+/// a peer that connects and never speaks would otherwise hold a session, an
+/// fd and an authenticated outbound leg forever. Matches
+/// `client::OUTBOUND_INACTIVITY`, so neither leg outlives the other.
+const INBOUND_INACTIVITY: Duration = Duration::from_secs(3600);
+/// How long the relay has to name the endpoint it wants.
+const TARGET_LINE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Sessions served at once.
+///
+/// Every connection costs an outbound TCP connect, a key exchange and a
+/// userauth against the remote host before the client inside the sandbox has
+/// said anything, so the accept loop has to be the thing that says no. With a
+/// confirm-on-use agent key each one is also a prompt on the user's desktop.
+const MAX_CONCURRENT_SESSIONS: usize = 32;
+/// Pause before accepting again after `accept` failed.
+///
+/// A sticky error (EMFILE, ENOMEM) would otherwise spin a worker thread flat
+/// out, and the same runtime serves the HTTP proxy.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Escape what came off the wire before it reaches a log line or a terminal.
+///
+/// Commands, subsystem names, `TERM` and the requested host are all chosen by
+/// the sandboxed process. A raw carriage return or ANSI escape in one of them
+/// would let it forge audit records and rewrite the operator's screen.
+pub(crate) fn escape_for_display(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            out.extend(ch.escape_debug());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
 
 /// One authorized endpoint plus what it may do there.
 #[derive(Debug, Clone)]
@@ -174,14 +215,17 @@ pub(crate) fn start(
     let listener = runtime
         .block_on(async { UnixListener::bind(&socket_path) })
         .map_err(|err| {
-            NonoError::SshBastion(format!(
-                "network.allow_ssh could not start the SSH mediation on '{}': {err}",
-                socket_path.display()
+            NonoError::Io(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "network.allow_ssh could not start the SSH mediation on '{}': {err}",
+                    socket_path.display()
+                ),
             ))
         })?;
 
     let server_config = Arc::new(russh::server::Config {
-        inactivity_timeout: None,
+        inactivity_timeout: Some(INBOUND_INACTIVITY),
         auth_rejection_time: std::time::Duration::from_secs(0),
         keys: vec![config.host_key],
         ..russh::server::Config::default()
@@ -196,11 +240,24 @@ pub(crate) fn start(
         credential: config.credential,
         default_user: config.default_user,
         server: server_config,
+        sessions: Arc::new(Semaphore::new(MAX_CONCURRENT_SESSIONS)),
     });
 
     runtime.spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(err) => {
+                    tracing::warn!("ssh bastion could not accept a connection: {err}");
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = shared.sessions.clone().try_acquire_owned() else {
+                tracing::warn!(
+                    "ssh bastion refused a connection: {MAX_CONCURRENT_SESSIONS} sessions are \
+                     already open"
+                );
                 continue;
             };
             let shared = shared.clone();
@@ -210,6 +267,7 @@ pub(crate) fn start(
                 if let Err(err) = handle_connection(shared, stream).await {
                     tracing::warn!("ssh bastion session ended: {err}");
                 }
+                drop(permit);
             });
         }
     });
@@ -228,6 +286,7 @@ struct SharedConfig {
     credential: SshCredential,
     default_user: String,
     server: Arc<russh::server::Config>,
+    sessions: Arc<Semaphore>,
 }
 
 async fn handle_connection(shared: Arc<SharedConfig>, mut stream: UnixStream) -> Result<()> {
@@ -238,7 +297,8 @@ async fn handle_connection(shared: Arc<SharedConfig>, mut stream: UnixStream) ->
         .authorize(&host, port, &shared.default_user)
     else {
         let message = format!(
-            "{host}:{port} is not an allowed SSH endpoint. Allowed: {}",
+            "{}:{port} is not an allowed SSH endpoint. Allowed: {}",
+            escape_for_display(&host),
             shared.allowances.describe_all()
         );
         audit::refused_endpoint(&host, port);
@@ -281,15 +341,30 @@ async fn handle_connection(shared: Arc<SharedConfig>, mut stream: UnixStream) ->
 /// Byte at a time on purpose: the SSH identification banner is already on its
 /// way behind this line, and a buffered read would swallow part of it.
 async fn read_target(stream: &mut UnixStream) -> Result<(String, u16)> {
+    let line = tokio::time::timeout(TARGET_LINE_TIMEOUT, read_target_line(stream))
+        .await
+        .map_err(|_| {
+            NonoError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "ssh bastion waited {}s for a target line and got none",
+                    TARGET_LINE_TIMEOUT.as_secs()
+                ),
+            ))
+        })??;
+    parse_target(&line)
+}
+
+async fn read_target_line(stream: &mut UnixStream) -> Result<String> {
     let mut line = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     loop {
-        let read = stream.read_exact(&mut byte).await.map_err(|err| {
-            NonoError::SshBastion(format!("ssh bastion could not read the target line: {err}"))
+        stream.read_exact(&mut byte).await.map_err(|err| {
+            NonoError::Io(std::io::Error::new(
+                err.kind(),
+                format!("ssh bastion could not read the target line: {err}"),
+            ))
         })?;
-        if read == 0 {
-            break;
-        }
         if byte[0] == b'\n' {
             break;
         }
@@ -301,10 +376,9 @@ async fn read_target(stream: &mut UnixStream) -> Result<(String, u16)> {
         line.push(byte[0]);
     }
 
-    let line = String::from_utf8(line).map_err(|_| {
+    String::from_utf8(line).map_err(|_| {
         NonoError::SshBastion("ssh bastion target line was not valid UTF-8".to_string())
-    })?;
-    parse_target(&line)
+    })
 }
 
 fn parse_target(line: &str) -> Result<(String, u16)> {
@@ -332,15 +406,38 @@ fn parse_target(line: &str) -> Result<(String, u16)> {
 /// uses, so "the policy refused this" and "the connection broke" are separate
 /// records rather than one indistinguishable failure.
 pub(crate) mod audit {
-    use super::{RefusedRequest, SessionTarget};
+    use super::{RefusedRequest, SessionTarget, escape_for_display};
 
-    pub(crate) fn allowed(target: &SessionTarget, request: &str, detail: Option<&str>) {
-        match detail {
-            Some(detail) => tracing::info!(
-                "ssh bastion allowed {request} on {}: {detail}",
+    /// One allowed request, as the audit log records it.
+    ///
+    /// `routine` mirrors `RefusedRequest::routine`: a window change on every
+    /// drag of a terminal corner is not worth an info line, an exec is.
+    pub(crate) struct Allowed {
+        pub(crate) request: &'static str,
+        pub(crate) detail: Option<String>,
+        pub(crate) routine: bool,
+    }
+
+    pub(crate) fn allowed(target: &SessionTarget, allowed: Allowed) {
+        // The detail is escaped here rather than at the callsite so that no
+        // future caller can forget: every one of them is wire data.
+        let line = match &allowed.detail {
+            Some(detail) => format!(
+                "ssh bastion allowed {} on {}: {}",
+                allowed.request,
+                target.describe(),
+                escape_for_display(detail)
+            ),
+            None => format!(
+                "ssh bastion allowed {} on {}",
+                allowed.request,
                 target.describe()
             ),
-            None => tracing::info!("ssh bastion allowed {request} on {}", target.describe()),
+        };
+        if allowed.routine {
+            tracing::debug!("{line}");
+        } else {
+            tracing::info!("{line}");
         }
     }
 
@@ -364,8 +461,21 @@ pub(crate) mod audit {
         }
     }
 
+    /// Record a channel the remote host tried to open back toward nono.
+    pub(crate) fn refused_remote(host: &str, port: u16, refusal: &RefusedRequest) {
+        tracing::warn!(
+            "ssh bastion refused {} from {}:{port}: {}",
+            refusal.request,
+            escape_for_display(host),
+            refusal.reason
+        );
+    }
+
     pub(crate) fn refused_endpoint(host: &str, port: u16) {
-        tracing::warn!("ssh bastion refused the endpoint {host}:{port}: no allowance covers it");
+        tracing::warn!(
+            "ssh bastion refused the endpoint {}:{port}: no allowance covers it",
+            escape_for_display(host)
+        );
     }
 }
 

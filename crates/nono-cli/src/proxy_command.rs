@@ -715,7 +715,7 @@ mod tests {
         assert_eq!(
             config.allowed_hosts,
             vec!["api.example.com"],
-            "the allowance grants a mediated session, not reachability"
+            "an allowance never grants reachability, here or under `nono run`"
         );
         assert_eq!(
             config.ssh_endpoints,

@@ -191,18 +191,3 @@ other port as reachable as it was.
 - **WHEN** a profile sets both an SSH allowance and a domain allowance
 - **THEN** both are in effect, the domain allowance keeps its existing
   host-level behavior, and the SSH allowance stays port-exact
-
-## REMOVED Requirements
-
-### Requirement: A raw tunnelling subcommand provides the SSH route
-
-**Reason**: The route is now a mediated SSH session. A subcommand that turns an
-allowed authority into a byte-transparent stream is exactly the capability this
-change removes: it cannot distinguish `git fetch` from an interactive shell or a
-port forward, and it is reachable by anything in the sandbox that can execute
-the nono binary.
-
-**Migration**: None required for users. The subcommand is hidden and is only
-referenced by the SSH configuration nono generates, which is regenerated to
-point at the mediated route. A caller invoking it directly now receives an
-unknown-subcommand error.

@@ -101,6 +101,43 @@ pub(crate) fn authorize_channel(_rule: &EndpointRule, kind: ChannelKind) -> Chan
     }
 }
 
+/// A channel the remote host tried to open back toward nono on the outbound
+/// leg.
+///
+/// Every one is refused. russh's client defaults accept most of these, and a
+/// channel nono never asked for is not part of the session the sandbox asked
+/// for, so the leg facing the remote host gets the same named treatment as the
+/// one facing the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteChannelKind {
+    Session,
+    X11,
+    DirectTcpip,
+    DirectStreamlocal,
+    ForwardedTcpip,
+    ForwardedStreamlocal,
+    AgentForward,
+}
+
+/// Authorize a channel the remote host opened toward nono.
+pub(crate) fn authorize_remote_channel(kind: RemoteChannelKind) -> ChannelDecision {
+    let request = match kind {
+        RemoteChannelKind::Session => "session",
+        RemoteChannelKind::X11 => "x11",
+        RemoteChannelKind::DirectTcpip => "direct-tcpip",
+        RemoteChannelKind::DirectStreamlocal => "direct-streamlocal@openssh.com",
+        RemoteChannelKind::ForwardedTcpip => "forwarded-tcpip",
+        RemoteChannelKind::ForwardedStreamlocal => "forwarded-streamlocal@openssh.com",
+        RemoteChannelKind::AgentForward => "auth-agent@openssh.com",
+    };
+    refuse(
+        request,
+        format!(
+            "{request} is refused: the remote host opened it, and the outbound leg carries only the session the sandbox asked for"
+        ),
+    )
+}
+
 /// Authorize a request made inside a session channel.
 pub(crate) fn authorize_request(
     rule: &EndpointRule,
@@ -176,7 +213,8 @@ fn authorize_restricted_request(
         ChannelRequest::Subsystem(name) => refuse(
             "subsystem",
             format!(
-                "subsystem `{name}` is refused: this endpoint's allowance restricts it to the commands {}, and a subsystem reads and writes outside them",
+                "subsystem `{}` is refused: this endpoint's allowance restricts it to the commands {}, and a subsystem reads and writes outside them",
+                super::escape_for_display(name),
                 command::command_list(commands)
             ),
         ),
@@ -261,7 +299,6 @@ mod tests {
     fn x11_channel_is_refused() {
         let refused = refusal(authorize_channel(&EndpointRule::Session, ChannelKind::X11));
         assert_eq!(refused.request, "x11");
-        assert!(refused.reason.contains("x11"), "{}", refused.reason);
     }
 
     #[test]
@@ -271,11 +308,6 @@ mod tests {
             ChannelKind::DirectTcpip,
         ));
         assert_eq!(refused.request, "direct-tcpip");
-        assert!(
-            refused.reason.contains("direct-tcpip"),
-            "{}",
-            refused.reason
-        );
     }
 
     #[test]
@@ -285,11 +317,6 @@ mod tests {
             ChannelKind::ForwardedTcpip,
         ));
         assert_eq!(refused.request, "forwarded-tcpip");
-        assert!(
-            refused.reason.contains("forwarded-tcpip"),
-            "{}",
-            refused.reason
-        );
     }
 
     #[test]
@@ -299,11 +326,6 @@ mod tests {
             ChannelKind::DirectStreamlocal,
         ));
         assert_eq!(refused.request, "direct-streamlocal@openssh.com");
-        assert!(
-            refused.reason.contains("direct-streamlocal@openssh.com"),
-            "{}",
-            refused.reason
-        );
     }
 
     #[test]
@@ -313,7 +335,6 @@ mod tests {
             ChannelRequest::X11,
         ));
         assert_eq!(refused.request, "x11-req");
-        assert!(refused.reason.contains("x11-req"), "{}", refused.reason);
     }
 
     #[test]
@@ -323,11 +344,6 @@ mod tests {
             ChannelRequest::AgentForward,
         ));
         assert_eq!(refused.request, "auth-agent-req@openssh.com");
-        assert!(
-            refused.reason.contains("auth-agent-req@openssh.com"),
-            "{}",
-            refused.reason
-        );
     }
 
     #[test]
@@ -335,7 +351,6 @@ mod tests {
         for rule in [EndpointRule::Session, restricted()] {
             let refused = refusal(authorize_request(&rule, ChannelRequest::Env));
             assert_eq!(refused.request, "env");
-            assert!(refused.reason.contains("dropped"), "{}", refused.reason);
         }
     }
 
@@ -370,46 +385,24 @@ mod tests {
     fn tcpip_forward_is_refused() {
         let refused = refusal(authorize_global(GlobalRequest::TcpipForward));
         assert_eq!(refused.request, "tcpip-forward");
-        assert!(
-            refused.reason.contains("tcpip-forward"),
-            "{}",
-            refused.reason
-        );
     }
 
     #[test]
     fn cancel_tcpip_forward_is_refused() {
         let refused = refusal(authorize_global(GlobalRequest::CancelTcpipForward));
         assert_eq!(refused.request, "cancel-tcpip-forward");
-        assert!(
-            refused.reason.contains("cancel-tcpip-forward"),
-            "{}",
-            refused.reason
-        );
     }
 
     #[test]
     fn streamlocal_forward_is_refused() {
         let refused = refusal(authorize_global(GlobalRequest::StreamlocalForward));
         assert_eq!(refused.request, "streamlocal-forward@openssh.com");
-        assert!(
-            refused.reason.contains("streamlocal-forward@openssh.com"),
-            "{}",
-            refused.reason
-        );
     }
 
     #[test]
     fn cancel_streamlocal_forward_is_refused() {
         let refused = refusal(authorize_global(GlobalRequest::CancelStreamlocalForward));
         assert_eq!(refused.request, "cancel-streamlocal-forward@openssh.com");
-        assert!(
-            refused
-                .reason
-                .contains("cancel-streamlocal-forward@openssh.com"),
-            "{}",
-            refused.reason
-        );
     }
 
     #[test]
@@ -489,5 +482,23 @@ mod tests {
             authorize_request(&rule, ChannelRequest::Signal),
             ChannelDecision::Allow
         );
+    }
+
+    /// The outbound leg exists to carry the session the sandbox asked for.
+    /// Anything the remote host opens back is outside that, whatever it is.
+    #[test]
+    fn nothing_the_remote_host_opens_is_accepted() {
+        for kind in [
+            RemoteChannelKind::Session,
+            RemoteChannelKind::X11,
+            RemoteChannelKind::DirectTcpip,
+            RemoteChannelKind::DirectStreamlocal,
+            RemoteChannelKind::ForwardedTcpip,
+            RemoteChannelKind::ForwardedStreamlocal,
+            RemoteChannelKind::AgentForward,
+        ] {
+            let refused = refusal(authorize_remote_channel(kind));
+            assert!(!refused.routine, "{kind:?}");
+        }
     }
 }

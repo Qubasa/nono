@@ -108,8 +108,9 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         nono::NonoError::CwdPromptRequired => NonoErrorCode::ErrInvalidArg,
         nono::NonoError::SandboxInit(_) => NonoErrorCode::ErrSandboxInit,
         nono::NonoError::UnsupportedPlatform(_) => NonoErrorCode::ErrUnsupportedPlatform,
-        // A mediation refusal is a policy decision, not transport trouble, so
-        // it shares a code with the other denials rather than with ErrIo.
+        // `SshBastion` carries mediation refusals only, so it shares a code
+        // with the other policy denials. Transport and configuration failures
+        // on that path arrive as `Io` and `ConfigParse`.
         nono::NonoError::BlockedCommand { .. } | nono::NonoError::SshBastion(_) => {
             NonoErrorCode::ErrBlockedCommand
         }
