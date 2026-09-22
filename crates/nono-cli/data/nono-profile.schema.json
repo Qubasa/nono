@@ -896,8 +896,13 @@
         },
         "allow_ssh": {
           "type": "array",
-          "items": { "type": "string" },
-          "description": "SSH endpoints the sandbox may reach, as [user@]host[:port]. Port-exact: the port defaults to 22 and no other port on that host is opened, unlike allow_domain. Wildcards are rejected. Activates proxy mode on its own."
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              { "$ref": "#/$defs/AllowSshWithCommands" }
+            ]
+          },
+          "description": "SSH endpoints the sandbox may reach, as [user@]host[:port] or as an object naming the endpoint and the exact commands it may run. Port-exact: the port defaults to 22 and no other port on that host is opened, unlike allow_domain. Wildcards are rejected. The user prefix names the remote identity nono authenticates as. Activates proxy mode on its own."
         },
         "credentials": {
           "type": "array",
@@ -1229,6 +1234,24 @@
           "type": "array",
           "items": { "$ref": "#/$defs/EndpointRule" },
           "description": "L7 method+path rules. Only requests matching at least one rule are allowed."
+        }
+      }
+    },
+    "AllowSshWithCommands": {
+      "type": "object",
+      "description": "SSH endpoint restricted to an exact set of command lines. An endpoint carrying a command list is a task endpoint, not a login: a shell, a pty and a subsystem are refused there. Matching is exact on the tokenised argument vector, and a requested command carrying shell metacharacters is refused before matching.",
+      "additionalProperties": false,
+      "required": ["endpoint", "commands"],
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "description": "SSH endpoint as [user@]host[:port], interpreted identically to the string form."
+        },
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Exact command lines this endpoint may run. An empty list is a load error rather than \"no restriction\"."
         }
       }
     },

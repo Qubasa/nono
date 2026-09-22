@@ -205,8 +205,13 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
             .map(|s| crate::proxy_runtime::parse_allow_domain_arg(s)),
     );
 
-    let mut allow_ssh: Vec<String> = network.map(|n| n.allow_ssh.clone()).unwrap_or_default();
-    allow_ssh.extend(args.allow_ssh.iter().cloned());
+    let mut allow_ssh: Vec<profile::AllowSshEntry> =
+        network.map(|n| n.allow_ssh.clone()).unwrap_or_default();
+    allow_ssh.extend(
+        args.allow_ssh
+            .iter()
+            .map(|entry| profile::AllowSshEntry::Plain(entry.clone())),
+    );
 
     let mut deny_domain: Vec<String> = network.map(|n| n.deny_domain.clone()).unwrap_or_default();
     deny_domain.extend(args.deny_proxy.iter().cloned());
@@ -669,7 +674,7 @@ mod tests {
     /// The standalone proxy is a second copy of the profile -> proxy merge; an
     /// `allow_ssh` it silently dropped would be a trap.
     #[test]
-    fn allow_ssh_reaches_the_standalone_proxy_allowlist() {
+    fn allow_ssh_reaches_the_standalone_proxy_as_a_pin() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _env = cleared_env();
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -699,18 +704,23 @@ mod tests {
             .expect("allow_ssh alone must produce a domain filter");
         assert_eq!(
             filter.allow_ssh,
-            vec!["build.example.com", "deploy@other.example.com:2222"]
+            vec![
+                profile::AllowSshEntry::Plain("build.example.com".to_string()),
+                profile::AllowSshEntry::Plain("deploy@other.example.com:2222".to_string())
+            ]
         );
 
         let config =
             crate::proxy_runtime::build_proxy_config_from_flags(&opts).expect("build proxy config");
-        assert!(
-            config.allowed_hosts.contains(&"build.example.com:22".to_string())
-                && config
-                    .allowed_hosts
-                    .contains(&"other.example.com:2222".to_string()),
-            "both SSH endpoints must reach the standalone proxy allowlist, got {:?}",
-            config.allowed_hosts
+        assert_eq!(
+            config.allowed_hosts,
+            vec!["api.example.com"],
+            "the allowance grants a mediated session, not reachability"
+        );
+        assert_eq!(
+            config.ssh_endpoints,
+            vec!["build.example.com:22", "other.example.com:2222"],
+            "both endpoints must still pin their port"
         );
     }
 

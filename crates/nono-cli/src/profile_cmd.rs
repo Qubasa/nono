@@ -1078,10 +1078,15 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             );
         }
         if !net.allow_ssh.is_empty() {
+            let display: Vec<String> = net
+                .allow_ssh
+                .iter()
+                .map(profile::AllowSshEntry::display)
+                .collect();
             println!(
                 "    {}: {}",
                 theme::fg("allow_ssh", t.subtext),
-                net.allow_ssh.join(", ")
+                display.join(", ")
             );
         }
         if !net.resolved_credentials().is_empty() {
@@ -1607,9 +1612,21 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         .iter()
         .map(|e| e.domain().to_string())
         .collect();
+    let p1_allow_ssh_strs: Vec<String> = p1
+        .network
+        .allow_ssh
+        .iter()
+        .map(profile::AllowSshEntry::display)
+        .collect();
+    let p2_allow_ssh_strs: Vec<String> = p2
+        .network
+        .allow_ssh
+        .iter()
+        .map(profile::AllowSshEntry::display)
+        .collect();
     let net_vec_diffs = diff_string_vecs(&[
         ("allow_domain", &p1_allow_domain_strs, &p2_allow_domain_strs),
-        ("allow_ssh", &p1.network.allow_ssh, &p2.network.allow_ssh),
+        ("allow_ssh", &p1_allow_ssh_strs, &p2_allow_ssh_strs),
         (
             "credentials",
             p1.network.resolved_credentials(),
@@ -2077,6 +2094,18 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
         .iter()
         .map(|e| e.domain().to_string())
         .collect();
+    let p1_allow_ssh_strs: Vec<String> = p1
+        .network
+        .allow_ssh
+        .iter()
+        .map(profile::AllowSshEntry::display)
+        .collect();
+    let p2_allow_ssh_strs: Vec<String> = p2
+        .network
+        .allow_ssh
+        .iter()
+        .map(profile::AllowSshEntry::display)
+        .collect();
 
     let ou1 = p1.open_urls.as_ref();
     let ou2 = p2.open_urls.as_ref();
@@ -2127,7 +2156,7 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
                 "changed": p1.network.resolved_network_profile() != p2.network.resolved_network_profile(),
             },
             "allow_domain": diff_vec(&p1_allow_domain_strs, &p2_allow_domain_strs),
-            "allow_ssh": diff_vec(&p1.network.allow_ssh, &p2.network.allow_ssh),
+            "allow_ssh": diff_vec(&p1_allow_ssh_strs, &p2_allow_ssh_strs),
             "credentials": diff_vec(p1.network.resolved_credentials(), p2.network.resolved_credentials()),
             "open_port": {
                 "profile1": p1.network.open_port,

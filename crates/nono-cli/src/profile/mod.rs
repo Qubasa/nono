@@ -1334,21 +1334,19 @@ fn validate_profile_domain_patterns(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
-/// Validate `network.allow_ssh` entries: one concrete host, port 1-65535.
+/// Validate `network.allow_ssh` entries: one concrete host, port 1-65535,
+/// and a non-empty command list when the object form is used.
 fn validate_profile_ssh_endpoints(profile: &Profile) -> Result<()> {
-    for entry in &profile.network.allow_ssh {
-        crate::network_policy::parse_ssh_endpoint(entry).map_err(|err| {
-            NonoError::ProfileParse(format!("network.allow_ssh entry invalid: {err}"))
-        })?;
-    }
-    Ok(())
+    crate::network_policy::resolve_ssh_allowances(&profile.network.allow_ssh)
+        .map(|_| ())
+        .map_err(|err| NonoError::ProfileParse(format!("network.allow_ssh entry invalid: {err}")))
 }
 
 #[must_use = "network.no_proxy conflict validation result must be handled"]
 pub(crate) fn validate_no_proxy_allow_domain_conflicts(
     no_proxy: &[String],
     allow_domain: &[AllowDomainEntry],
-    allow_ssh: &[String],
+    allow_ssh: &[AllowSshEntry],
 ) -> Result<()> {
     for allow_entry in allow_domain {
         let domain = allow_entry.domain();
@@ -1362,14 +1360,15 @@ pub(crate) fn validate_no_proxy_allow_domain_conflicts(
             }
         }
     }
-    for entry in allow_ssh {
-        let (host, _) = crate::network_policy::parse_ssh_endpoint(entry)?;
+    for allowance in crate::network_policy::resolve_ssh_allowances(allow_ssh)? {
+        let host = &allowance.endpoint.host;
         for no_proxy_entry in no_proxy {
-            if nono_proxy::config::no_proxy_entry_overlaps_host_pattern(no_proxy_entry, &host) {
+            if nono_proxy::config::no_proxy_entry_overlaps_host_pattern(no_proxy_entry, host) {
                 return Err(NonoError::ProfileParse(format!(
                     "network.no_proxy entry '{no_proxy_entry}' conflicts with \
-                     network.allow_ssh entry '{entry}': the SSH route must go through \
-                     the proxy allowlist, not bypass it"
+                     network.allow_ssh entry '{host}': the SSH endpoint is reached through \
+                     nono's mediated session, so a no_proxy entry claiming it bypasses the \
+                     proxy contradicts the allowance"
                 )));
             }
         }
@@ -1788,6 +1787,52 @@ impl AllowDomainEntry {
     }
 }
 
+/// An entry in the `allow_ssh` array.
+///
+/// Either a plain `[user@]host[:port]` string, or an object naming the same
+/// endpoint plus the exact commands it may run. An endpoint carrying a command
+/// list is a task endpoint, not a login: the bastion refuses a shell, a pty and
+/// a subsystem there, because each would run commands the list just refused.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AllowSshEntry {
+    /// Endpoint with the default session policy.
+    Plain(String),
+    /// Endpoint restricted to an exact set of command lines.
+    WithCommands {
+        endpoint: String,
+        #[serde(default)]
+        commands: Vec<String>,
+    },
+}
+
+impl AllowSshEntry {
+    /// The `[user@]host[:port]` endpoint, regardless of variant.
+    pub fn endpoint(&self) -> &str {
+        match self {
+            Self::Plain(endpoint) | Self::WithCommands { endpoint, .. } => endpoint,
+        }
+    }
+
+    /// The command allowlist, empty when the entry does not restrict commands.
+    pub fn commands(&self) -> &[String] {
+        match self {
+            Self::Plain(_) => &[],
+            Self::WithCommands { commands, .. } => commands,
+        }
+    }
+
+    /// One-line rendering for profile listings and diffs.
+    pub fn display(&self) -> String {
+        match self {
+            Self::Plain(endpoint) => endpoint.clone(),
+            Self::WithCommands { endpoint, commands } => {
+                format!("{endpoint} [{}]", commands.join(", "))
+            }
+        }
+    }
+}
+
 /// Network configuration in a profile
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1812,12 +1857,13 @@ pub struct NetworkConfig {
     /// Entries can be plain hostname strings or objects with endpoint rules.
     #[serde(default, rename = "allow_domain")]
     pub allow_domain: Vec<AllowDomainEntry>,
-    /// SSH endpoints the sandbox may reach, as `[user@]host[:port]`.
+    /// SSH endpoints the sandbox may reach, as `[user@]host[:port]` or as an
+    /// object naming the endpoint and the commands it may run.
     ///
     /// Unlike `allow_domain`, entries are port-exact: the port defaults to 22
     /// and no other port on the same host is permitted. Wildcards are rejected.
     #[serde(default)]
-    pub allow_ssh: Vec<String>,
+    pub allow_ssh: Vec<AllowSshEntry>,
     /// Domains to deny through the proxy regardless of the allowlist.
     /// Supports the same wildcard syntax as `allow_domain` (e.g. `*.ads.example.com`).
     #[serde(default)]
@@ -6884,7 +6930,7 @@ mod tests {
                 allow_http2: false,
                 network_profile: InheritableValue::Set("base-net".to_string()),
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
-                allow_ssh: vec!["base.example.com".to_string()],
+                allow_ssh: vec![AllowSshEntry::Plain("base.example.com".to_string())],
                 deny_domain: vec![],
                 open_port: vec![3000],
                 open_port_range: vec![],
@@ -6977,8 +7023,8 @@ mod tests {
                 network_profile: InheritableValue::Inherit,
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
                 allow_ssh: vec![
-                    "base.example.com".to_string(),
-                    "deploy@child.example.com:2222".to_string(),
+                    AllowSshEntry::Plain("base.example.com".to_string()),
+                    AllowSshEntry::Plain("deploy@child.example.com:2222".to_string()),
                 ],
                 deny_domain: vec![],
                 open_port: vec![3000, 5000],
@@ -7072,8 +7118,8 @@ mod tests {
         assert_eq!(
             merged.network.allow_ssh,
             vec![
-                "base.example.com".to_string(),
-                "deploy@child.example.com:2222".to_string()
+                AllowSshEntry::Plain("base.example.com".to_string()),
+                AllowSshEntry::Plain("deploy@child.example.com:2222".to_string())
             ]
         );
     }
@@ -8769,7 +8815,12 @@ mod tests {
                 "network": { "allow_ssh": ["deploy@build.example.com:2222"] }
             }"#,
         )?;
-        assert_eq!(profile.network.allow_ssh, vec!["deploy@build.example.com:2222"]);
+        assert_eq!(
+            profile.network.allow_ssh,
+            vec![AllowSshEntry::Plain(
+                "deploy@build.example.com:2222".to_string()
+            )]
+        );
         Ok(())
     }
 

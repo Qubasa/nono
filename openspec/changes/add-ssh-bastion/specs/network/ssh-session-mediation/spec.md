@@ -184,9 +184,16 @@ cannot reach: an authentication agent nono holds outside the sandbox, or a key
 file nono reads itself before the sandbox starts.
 
 The sandbox MUST NOT require a grant for the agent socket or the key file in
-order for SSH to work. A sandboxed process MUST NOT be able to obtain a
-signature for a host no allowance covers, and MUST NOT be able to read the key
-material.
+order for SSH to work. Key material MUST NOT be readable from inside the
+sandbox, and nono MUST NOT itself place an agent socket there.
+
+This bounds what nono hands over; it does not by itself bound what the sandbox
+can already reach. Whether a sandboxed process can open the host's agent socket
+on its own is decided by `AF_UNIX` mediation, not by this capability. When
+`AF_UNIX` mediation is active, a sandboxed process MUST NOT be able to obtain a
+signature for a host no allowance covers. When it is inactive - the default in
+proxy-only mode - that guarantee does not hold, and documentation MUST say so
+rather than claim containment the sandbox does not have.
 
 When no usable credential is available, or the credential cannot be used without
 interaction that is not possible at that point - an encrypted key file with no
@@ -197,14 +204,22 @@ instead is not permitted.
 #### Scenario: Agent-backed authentication
 
 - **WHEN** an SSH allowance is used and the user has an authentication agent
-- **THEN** SSH to the allowed endpoint authenticates, and no agent socket is
-  present inside the sandbox
+- **THEN** SSH to the allowed endpoint authenticates, and nono places no agent
+  socket inside the sandbox
 
 #### Scenario: Signature for a non-allowed host
 
 - **WHEN** a sandboxed process attempts to obtain a signature from the
-  authentication agent for a host no allowance covers
+  authentication agent for a host no allowance covers, and `AF_UNIX` mediation
+  is active
 - **THEN** it cannot reach the agent at all, so no signature is produced
+
+#### Scenario: Agent reachable without AF_UNIX mediation
+
+- **WHEN** an SSH allowance is in effect and `AF_UNIX` mediation is inactive
+- **THEN** the mediated SSH route still works and still refuses non-allowed
+  endpoints, and the documented behaviour states plainly that the host agent
+  remains reachable by other means in that configuration
 
 #### Scenario: Encrypted key file
 

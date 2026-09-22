@@ -669,17 +669,18 @@ IN-BAND DETACH:
     #[command(hide = true)]
     PackUpdateHintHelper(PackUpdateHintHelperArgs),
 
-    /// Internal: HTTP CONNECT client used as an OpenSSH ProxyCommand
+    /// Internal: stdio relay to the SSH mediation, used as an OpenSSH ProxyCommand
     #[command(hide = true)]
-    SshTunnel(SshTunnelArgs),
+    SshRelay(SshRelayArgs),
 }
 
-/// Arguments for the hidden `nono ssh-tunnel` helper.
+/// Arguments for the hidden `nono ssh-relay` helper.
 ///
 /// OpenSSH substitutes `%h` and `%p` into the configured `ProxyCommand`, so
-/// the host and port arrive as plain positionals.
+/// the host and port arrive as plain positionals. They come from inside the
+/// sandbox, so the parent re-checks them against the allowances.
 #[derive(Parser, Debug)]
-pub struct SshTunnelArgs {
+pub struct SshRelayArgs {
     /// Target host (OpenSSH `%h`)
     pub host: String,
 
@@ -1212,6 +1213,17 @@ pub struct SandboxArgs {
     )]
     pub allow_ssh: Vec<String>,
 
+    /// Private key nono authenticates the SSH mediation with, read in the
+    /// parent before the sandbox starts. Not granted to the sandbox. Without
+    /// it, nono uses the ssh-agent at its own SSH_AUTH_SOCK.
+    #[arg(
+        long = "ssh-key",
+        env = "NONO_SSH_KEY",
+        value_name = "FILE",
+        help_heading = "NETWORK"
+    )]
+    pub ssh_key: Option<PathBuf>,
+
     /// Block a domain through the proxy. Evaluated before the allowlist.
     /// Supports wildcards (e.g. *.ads.example.com). Incompatible with --allow-net.
     #[arg(
@@ -1551,6 +1563,17 @@ pub struct ProxyArgs {
         help_heading = "NETWORK"
     )]
     pub allow_ssh: Vec<String>,
+
+    /// Private key nono authenticates the SSH mediation with, read in the
+    /// parent before the sandbox starts. Not granted to the sandbox. Without
+    /// it, nono uses the ssh-agent at its own SSH_AUTH_SOCK.
+    #[arg(
+        long = "ssh-key",
+        env = "NONO_SSH_KEY",
+        value_name = "FILE",
+        help_heading = "NETWORK"
+    )]
+    pub ssh_key: Option<PathBuf>,
 
     /// Block a domain through the proxy. Evaluated before the allowlist.
     /// Supports wildcards (e.g. *.ads.example.com).
@@ -1900,6 +1923,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             network_profile: None,
             allow_proxy: Vec::new(),
             allow_ssh: Vec::new(),
+            ssh_key: None,
             deny_proxy: Vec::new(),
             allow_bind: args.allow_bind,
             allow_port: args.allow_port,

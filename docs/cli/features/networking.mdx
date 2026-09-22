@@ -26,7 +26,7 @@ The proxy supports three modes that can be combined in a single session:
 
 | Mode | What it does | Activated by |
 |------|-------------|--------------|
-| **CONNECT tunnel** | Domain-filtered HTTPS tunneling. Validates the target host against an allowlist, then relays raw TCP bytes. TLS is end-to-end — the proxy never sees plaintext. | `--allow-domain`, `--allow-ssh`, `--network-profile` |
+| **CONNECT tunnel** | Domain-filtered HTTPS tunneling. Validates the target host against an allowlist, then relays raw TCP bytes. TLS is end-to-end — the proxy never sees plaintext. | `--allow-domain`, `--network-profile` |
 | **Reverse proxy** | Credential injection for API calls. Requests arrive at `http://localhost:<port>/<service>/...`, the proxy injects the real API key and forwards to the upstream over TLS. | `--credential` |
 | **External proxy** | Enterprise proxy passthrough. CONNECT requests are chained through a corporate proxy. Cloud metadata endpoints are still denied. | `--upstream-proxy` |
 
@@ -151,7 +151,7 @@ A `*` that only occupies part of a label (`foo*bar.com`), or a leading `*.` comb
 
 ### SSH Egress Pinning
 
-`network.allow_ssh` (CLI: `--allow-ssh`, repeatable, reads `NONO_ALLOW_SSH`) allows SSH to specific endpoints through the same CONNECT tunnel. Unlike `allow_domain`, each entry is pinned to one port.
+`network.allow_ssh` (CLI: `--allow-ssh`, repeatable, reads `NONO_ALLOW_SSH`) allows SSH to specific endpoints. The route is a mediated SSH session, not a tunnel: the sandboxed client speaks SSH to nono over a session-scoped unix socket, nono opens its own SSH session to the endpoint, and the two are relayed channel by channel. Each entry is pinned to one port.
 
 ```json
 {
@@ -167,14 +167,16 @@ A `*` that only occupies part of a label (`foo*bar.com`), or a leading `*.` comb
 nono run --allow-cwd --allow-ssh build.example.com -- git fetch
 ```
 
-`allow_ssh` is the only network key in that profile, and that is enough: it activates proxy mode on its own. The session gets a running proxy and `ProxyOnly` network mode.
+`allow_ssh` is the only network key in that profile, and that is enough: it activates proxy mode on its own. The session gets a running proxy, `ProxyOnly` network mode, and a mediated SSH route.
 
-Each entry does two things. It **grants** its own `host:port`, and it **pins** that port: every port named by an `allow_ssh` entry becomes closed on every host the entry list does not name. The pin is what makes the allowance mean something on an open policy. A profile with no `allow_domain` and no `network_profile` reaches everything, and adding `--allow-ssh build.example.com` to it does not close HTTPS to anywhere - it closes **port 22** everywhere except `build.example.com`.
+Each entry does two things. It **authorizes** a mediated session to its own `host:port`, and it **pins** that port: every port named by an `allow_ssh` entry becomes closed on every host the entry list does not name. The pin is what makes the allowance mean something on an open policy. A profile with no `allow_domain` and no `network_profile` reaches everything, and adding `--allow-ssh build.example.com` to it does not close HTTPS to anywhere - it closes **port 22** everywhere except `build.example.com`.
+
+What an entry never does is make the endpoint reachable as raw TCP. `allow_ssh` puts nothing in the proxy allowlist, so `CONNECT build.example.com:22` is refused on the allowed host exactly as it is on every other host. The mediated session is the only route to the endpoint.
 
 ```bash
 nono run --allow-cwd --allow-ssh build.example.com -- sh -c '
-  ssh build.example.com     # reaches the host
-  ssh other.example.com     # 403: port 22 is pinned elsewhere
+  ssh build.example.com     # mediated session to the allowed endpoint
+  ssh other.example.com     # refused: port 22 is pinned elsewhere
   curl https://example.com  # 200: the pin does not touch port 443
 '
 ```
@@ -183,16 +185,65 @@ The pin is evaluated before the allowlist and before `allow_domain`, so a wildca
 
 #### Entry Syntax and Port Exactness
 
-Entries are `[user@]host[:port]`. The port defaults to `22`, and any `user@` prefix is accepted and ignored, so an SSH target copied out of a shell command pastes verbatim. IPv6 literals must be bracketed (`[::1]:22`). Wildcards (`*.example.com`), an empty host, a non-numeric port, and a port outside 1-65535 are rejected at profile load time; the error names the offending entry.
+Entries are `[user@]host[:port]`, or the object form described in [Per-Endpoint Command Allowlist](#per-endpoint-command-allowlist); both forms mix freely in one list. The port defaults to `22`. IPv6 literals must be bracketed (`[::1]:22`). Wildcards (`*.example.com`), an empty host, a non-numeric port, and a port outside 1-65535 are rejected at profile load time; the error names the offending entry.
+
+The `user@` prefix names the remote user **nono** authenticates as. `--allow-ssh deploy@build.example.com` authenticates as `deploy`; an entry with no prefix uses the username nono itself runs as, exactly as a plain `ssh host` would. The prefix has no effect on which endpoints are reachable, and the sandbox does not choose the remote identity: a sandboxed `ssh root@build.example.com` reaches the endpoint and runs there as `deploy`.
 
 | Key | What `build.example.com` does |
 |-----|-------------------------------|
-| `allow_ssh` | Grants `build.example.com:22`, and closes port 22 on every other host. Other ports are untouched. |
+| `allow_ssh` | Authorizes a mediated SSH session to `build.example.com:22`, and closes port 22 on every other host. Other ports are untouched, and the endpoint itself is not reachable as raw TCP. |
 | `allow_domain` | Grants the host on every port - any `:port` suffix is stripped, with a warning that the port is ignored. |
 
 Two different refusals report this. `nono why --host other.example.com --port 22` reports `ssh_port_pinned` and names the endpoints the port is pinned to. `nono why --host build.example.com --port 443`, on a policy that is already filtering, reports `port_not_allowed` and names the port the host is allowed on. Configured endpoints appear in `nono profile show`, `nono profile show --json` (key `allow_ssh` under `network`), `nono profile diff` (also with `--json`), and `nono why --self`.
 
 Across profile inheritance, `allow_ssh` entries are appended and deduplicated, the same as `deny_domain` and `no_proxy`.
+
+#### What the Session May Do
+
+nono authorizes every channel and every channel request on its own. A `session` channel is relayed, and inside it `shell`, `exec`, `pty-req`, `window-change`, `subsystem` and `signal` run on the remote host.
+
+Everything that would turn the session into a transport is refused, and the refusal names the request type:
+
+| Refused | Wire name | Asked for by |
+|---------|-----------|--------------|
+| Local forwarding, dynamic forwarding, jump hosts | `direct-tcpip` | `ssh -L`, `ssh -D`, `ssh -J` |
+| Remote forwarding | `tcpip-forward` | `ssh -R` |
+| Agent forwarding | `auth-agent-req@openssh.com` | `ssh -A` |
+| X11 forwarding | `x11-req` | `ssh -X`, `ssh -Y` |
+
+A refusal arrives as a failed channel request, not as a broken connection, so a command or shell already running in the same session keeps running. A channel type or channel request nono does not recognise is refused rather than forwarded to the remote host.
+
+Two layers can refuse the same flag, and which one speaks first depends on the flag. `ssh -L` usually never reaches the bastion at all: binding the local listener is itself a sandboxed operation, so the seccomp port pin refuses it with `bind: Permission denied` before any channel is opened. `ssh -J` reaches the `direct-tcpip` rule and is refused there. Either way the answer is no; only the wording differs.
+
+`sftp`, `scp` and `rsync -e ssh` keep working, because each one is a subsystem or a remote command inside a session channel.
+
+#### Per-Endpoint Command Allowlist
+
+An entry written as an object names the exact commands its endpoint may run:
+
+```json
+{
+  "network": {
+    "allow_ssh": [
+      "git@build.example.com",
+      { "endpoint": "git@deploy.example.com",
+        "commands": ["git-upload-pack /srv/repo.git"] }
+    ]
+  }
+}
+```
+
+Matching is exact on the tokenised argument vector, after quote-aware POSIX word splitting of both the rule and the request. `git-upload-pack '/srv/repo.git'` and `git-upload-pack /srv/repo.git` are therefore the same rule, which matters because OpenSSH's Git integration quotes the repository path and a plain `ssh host cmd` does not. There is no prefix matching, no globbing and no argument templating: a rule covers that command with those arguments and nothing else.
+
+A requested command carrying shell metacharacters (`;`, `|`, `&`, `$`, a backtick, `(`, `)`, `<`, `>`, `{`, `}`, or a newline) is refused before matching is attempted, whether or not the list would otherwise permit it. Those characters are interpreted by the remote shell, and nono cannot evaluate them.
+
+An endpoint that carries a command list is a task endpoint, not a login: `shell`, `pty-req` and `subsystem` are refused there, because an interactive shell would run the commands the list just refused. An empty `commands` list is a load error, since it reads as either "no restriction" or "nothing may run". An entry with no command list keeps the default session behavior.
+
+The example above allows `git fetch` from `deploy.example.com` and refuses `git push`: a fetch runs `git-upload-pack /srv/repo.git`, a push runs `git-receive-pack /srv/repo.git`, and only the first is named. Allowing pushes is one more string in the list.
+
+<Note>
+  The allowlist bounds which commands **start**. Bounding what an allowed command then does is the remote host's job: `git-receive-pack` is a push, and a push can run remote hooks. Use `authorized_keys` with `restrict` or `command=` on the endpoint for that. The two controls compose.
+</Note>
 
 #### Client Wiring
 
@@ -200,10 +251,12 @@ When `allow_ssh` is active, nono materialises a generated OpenSSH config in a se
 
 ```
 Host *
-  ProxyCommand /path/to/nono ssh-tunnel %h %p
+  ProxyCommand /path/to/nono ssh-relay %h %p
+  StrictHostKeyChecking yes
+  UserKnownHostsFile <session-dir>/known_hosts
 ```
 
-`nono ssh-tunnel` is a hidden helper subcommand (an HTTP CONNECT client) that exists for this `ProxyCommand`; it is not a user-facing command. Two environment tweaks point clients at the generated config:
+`nono ssh-relay` is a hidden helper subcommand that exists for this `ProxyCommand`; it is not a user-facing command. It connects to the session's unix socket and copies stdio both ways, and that is all it does: it holds no policy and no credential, because the SSH session it carries terminates at nono in the parent process, outside the sandbox. Two environment tweaks point clients at the generated config:
 
 - `GIT_SSH_COMMAND="ssh -F <config>"`, so `git clone ssh://…` works unmodified.
 - A directory containing a generated `ssh` wrapper is prepended to the child's `PATH`, so an `ssh` that the sandboxed process resolves itself — from a shell, a build script, a `Makefile` — picks the config up too. It is not installed under Tool Sandbox, where the shim directory owns `ssh` on `PATH`.
@@ -211,7 +264,7 @@ Host *
 Both are removed when the session ends.
 
 <Note>
-  The generated config and the PATH wrapper are ergonomics, not enforcement. Invoking `/usr/bin/ssh` by absolute path skips both and fails closed with `EACCES` — bypassing the wrapper never widens access. The enforcement boundary is the kernel destination pin: a seccomp user-notification filter that restricts `connect`/`sendto` to the proxy address.
+  The generated config and the PATH wrapper are ergonomics, not enforcement. Invoking `/usr/bin/ssh` by absolute path skips both and fails closed with `EACCES` - bypassing the wrapper never widens access. Two things enforce: the kernel destination pin, a seccomp user-notification filter that restricts `connect`/`sendto` to the proxy address, and the mediation itself, which authorizes each channel request after the client's session has already terminated at nono.
 </Note>
 
 <Note>
@@ -228,25 +281,43 @@ Each of these is refused before the sandbox starts:
 
 | Combination | Reason |
 |-------------|--------|
-| `--block-net` with `--allow-ssh` | Contradictory: SSH egress pinning requires proxy mode. |
+| `--block-net` with `--allow-ssh` | Contradictory: the mediated SSH route requires proxy mode. |
 | `--allow-net` with `--allow-ssh` | `--allow-net` bypasses the proxy entirely, so the destination pin could not apply. |
-| A host in both `allow_ssh` and `network.no_proxy` | The SSH route must go through the proxy allowlist, not bypass it. |
+| A host in both `allow_ssh` and `network.no_proxy` | `no_proxy` tells clients to go direct for that host, and there is no direct route: the endpoint is reachable only through the mediated session. |
 | Any configuration where the seccomp-notify supervisor is not installed | The supervisor is the destination pin. This covers `linux.sandbox_policy` of `landlock` or `external`, and WSL2, where seccomp notify returns `EBUSY`. Landlock filters by port only, so the "just this endpoint" allowance could not be kernel-enforced. |
 
 The refusal is keyed off whether the pin will actually be installed, not off a list of policy names, so `allow_ssh` on WSL2 is rejected outright rather than degrading through `security.wsl2_proxy_policy`. See [Credential Proxy on WSL2](/cli/internals/wsl2#credential-proxy-on-wsl2).
 
-#### Key Posture
+#### Credentials
 
-Grant one dedicated SSH key with `filesystem.read_file`, and pass `-o IdentitiesOnly=yes` so the client offers only that key. It has to be a command-line option: the generated config is passed with `ssh -F`, so `~/.ssh/config` is not read inside the session.
+nono authenticates to the endpoint itself, in the parent, before the sandbox is built. It uses `--ssh-key FILE` when one is given, and otherwise the host's `SSH_AUTH_SOCK`. The sandbox needs no grant for either: there is no key file and no agent socket inside it, and the in-sandbox client authenticates to nono with no credential at all.
 
 ```json
 {
-  "filesystem": { "read_file": ["$HOME/.ssh/id_build"] },
+  "filesystem": { "allow": ["$WORKDIR"] },
   "network": { "allow_ssh": ["git@build.example.com"] }
 }
 ```
 
-Forwarding `$SSH_AUTH_SOCK` into the sandbox instead (via `filesystem.unix_socket`) weakens the guarantee: the agent can sign for every key it holds, and the sandboxed process can use any of them for the duration of the session. `tool-sandbox-examples/git-ssh/` demonstrates the agent-forwarding setup.
+That closes the hole nono used to open itself. It does not, on its own, close every route to a credential the sandbox can already see. `AF_UNIX` mediation is off by default in proxy-only mode, and with it off a process inside the sandbox can connect to the host's `SSH_AUTH_SOCK` directly and get a signature for any host, with or without `allow_ssh`. To put the agent out of reach, turn mediation on:
+
+```json
+{
+  "filesystem": { "allow": ["$WORKDIR"] },
+  "linux": { "af_unix_mediation": "pathname" },
+  "network": { "allow_ssh": ["git@build.example.com"] }
+}
+```
+
+A caller that still passes `--allow-unix-socket "$SSH_AUTH_SOCK"` gets a warning. The grant is no longer needed, and it re-opens the hole the mediation closes: an agent reachable from inside the sandbox signs for every key it holds, for as long as the session runs.
+
+A credential that cannot be used without interaction fails at startup rather than mid-session. An encrypted key file is refused with an error naming the file and pointing at `ssh-add`, instead of prompting for a passphrase; hardware-backed (`sk-*`) keys and certificates are agent-only, and a key file of either kind is refused at startup for the same reason.
+
+#### Host Keys
+
+nono verifies the endpoint's host key against your `~/.ssh/known_hosts` before relaying anything, in the parent. An unknown key is refused: there is no trust on first use for a sandboxed session, and nono never writes to the store. A changed key is refused with an error naming the endpoint and stating that the key changed. Verify a new endpoint outside nono first, in an ordinary `ssh` session.
+
+The client inside the sandbox is handed a generated `known_hosts` naming only nono's own host key, which is generated fresh for each session. No process in the sandbox can make a trust decision about a remote host, and a key captured from one session is not accepted in the next.
 
 ### Denying Domains
 
@@ -382,7 +453,7 @@ Settings are loaded from `--profile` and extended/overridden by explicit flags, 
 | `--max-connections <N>` | Maximum concurrent client connections (`0` = unlimited, default `256`). Raise for highly parallel clients such as `docker pull`. Reads `NONO_PROXY_MAX_CONNECTIONS`. |
 | `--network-profile <PROFILE>` | Enable a named network profile (e.g. `developer`). |
 | `--allow-domain <DOMAIN_OR_URL>` | Add a domain (or path-scoped URL) to the allowlist (repeatable). |
-| `--allow-ssh <SSH_TARGET>` | Allow one SSH endpoint as `[user@]host[:port]`, port-exact, default port 22 (repeatable). |
+| `--allow-ssh <SSH_TARGET>` | Pin one SSH endpoint as `[user@]host[:port]`, port-exact, default port 22 (repeatable). Closes that port on every other host; it does not open a CONNECT tunnel to the endpoint. |
 | `--credential <SERVICE>` | Inject credentials for a service via the reverse proxy (repeatable). |
 | `--allow-endpoint <SERVICE:METHOD:PATH>` | Restrict a credential service to specific HTTP method+path patterns (repeatable). See [Endpoint Filtering](#endpoint-filtering). |
 | `--upstream-proxy <HOST:PORT>` | Chain outbound traffic through an upstream proxy. |

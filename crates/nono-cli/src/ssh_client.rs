@@ -2,13 +2,19 @@
 //!
 //! `ssh` has no environment variable for `ProxyCommand`, so the setting has to
 //! reach it as a file. This module materialises a session-scoped config that
-//! routes every SSH target through `nono ssh-tunnel`, plus an `ssh` wrapper
+//! routes every SSH target through `nono ssh-relay`, plus an `ssh` wrapper
 //! that gets prepended to the child's `PATH` so a bare `ssh` picks the config
 //! up too.
 //!
 //! Both are **ergonomics, not enforcement**. Invoking `/usr/bin/ssh` by
 //! absolute path skips them and fails closed with `EACCES`, because the
-//! seccomp-notify destination pin is what contains the process.
+//! seccomp-notify destination pin is what contains the process, and the
+//! endpoint is reachable only through the mediation in the parent.
+//!
+//! The per-session host key generated here is the inbound half of the two
+//! known-hosts stores: the client is given a `known_hosts` naming only that
+//! key, so no process in the sandbox can make a trust decision about a real
+//! remote host, and a key captured from one session is useless in the next.
 
 use nono::{NonoError, Result};
 use std::path::{Path, PathBuf};
@@ -22,11 +28,21 @@ pub(crate) struct SshClientFiles {
     config_path: PathBuf,
     bin_dir: PathBuf,
     wrapper_path: Option<PathBuf>,
+    known_hosts_path: PathBuf,
+    socket_path: PathBuf,
+    host_key: russh::keys::PrivateKey,
 }
 
 impl SshClientFiles {
     pub(crate) fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    /// Generated `known_hosts` naming nono's per-session host key. The client
+    /// verifies the mediation against it, so it must be readable inside the
+    /// sandbox or every session fails host-key verification.
+    pub(crate) fn known_hosts_path(&self) -> &Path {
+        &self.known_hosts_path
     }
 
     /// Directory to prepend to the child's `PATH`, when a wrapper was created.
@@ -40,7 +56,20 @@ impl SshClientFiles {
 
     /// `GIT_SSH_COMMAND` value pointing git's SSH at the generated config.
     pub(crate) fn git_ssh_command(&self) -> String {
-        format!("ssh -F {}", shell_quote(&self.config_path.to_string_lossy()))
+        format!(
+            "ssh -F {}",
+            shell_quote(&self.config_path.to_string_lossy())
+        )
+    }
+
+    /// Unix socket the relay connects to, bound by the bastion.
+    pub(crate) fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// The per-session host key, handed to the bastion's server config.
+    pub(crate) fn host_key(&self) -> russh::keys::PrivateKey {
+        self.host_key.clone()
     }
 }
 
@@ -72,12 +101,44 @@ pub(crate) fn prepare_ssh_client_files(nono_exe: &Path) -> Result<SshClientFiles
     let bin_dir = root.join("bin");
     create_private_dir(&bin_dir)?;
 
-    // `Host *` is deliberate: a non-allowed host then fails with the proxy's
-    // "403 ... is not in the allowlist", which names the host, instead of a
-    // bare EACCES from a direct connect.
+    // The generated known_hosts names nono's own per-session key for `*`.
+    // `*` is safe precisely because the relay delivers whatever endpoint the
+    // parent authorizes: the name the client thinks it is talking to is not a
+    // trust input on this leg.
+    let host_key =
+        russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+            .map_err(|err| {
+                NonoError::SshBastion(format!(
+                    "network.allow_ssh could not generate a session host key: {err}"
+                ))
+            })?;
+    let public_key = host_key.public_key().to_openssh().map_err(|err| {
+        NonoError::SshBastion(format!(
+            "network.allow_ssh could not encode the session host key: {err}"
+        ))
+    })?;
+    let known_hosts_path = root.join("known_hosts");
+    write_new(
+        &known_hosts_path,
+        format!("* {public_key}\n").as_bytes(),
+        0o400,
+    )?;
+
+    let socket_path = root.join("bastion.sock");
+
+    // `Host *` is deliberate: a non-allowed host then fails with the
+    // mediation's "is not an allowed SSH endpoint", which names the host,
+    // instead of a bare EACCES from a direct connect.
     let config = format!(
-        "Host *\n  ProxyCommand {} ssh-tunnel %h %p\n",
-        shell_quote(&nono_exe.to_string_lossy())
+        "Host *\n  \
+         ProxyCommand {nono} ssh-relay %h %p\n  \
+         StrictHostKeyChecking yes\n  \
+         UserKnownHostsFile {known_hosts}\n  \
+         IdentityAgent none\n  \
+         PubkeyAuthentication no\n  \
+         PasswordAuthentication no\n",
+        nono = shell_quote(&nono_exe.to_string_lossy()),
+        known_hosts = shell_quote(&known_hosts_path.to_string_lossy()),
     );
     write_new(&config_path, config.as_bytes(), 0o400)?;
 
@@ -101,6 +162,9 @@ pub(crate) fn prepare_ssh_client_files(nono_exe: &Path) -> Result<SshClientFiles
         config_path,
         bin_dir,
         wrapper_path,
+        known_hosts_path,
+        socket_path,
+        host_key,
     })
 }
 
@@ -213,13 +277,17 @@ mod tests {
     }
 
     #[test]
-    fn generated_config_points_at_the_tunnel_and_is_read_only() {
+    fn generated_config_points_at_the_relay_and_is_read_only() {
         let (_dir, _env, _lock) = isolated_state();
         let exe = PathBuf::from("/opt/nono bin/nono");
         let files = prepare_ssh_client_files(&exe).expect("prepare ssh client files");
         let config = std::fs::read_to_string(files.config_path()).expect("read config");
         assert!(config.starts_with("Host *\n"));
-        assert!(config.contains("ProxyCommand '/opt/nono bin/nono' ssh-tunnel %h %p"));
+        assert!(config.contains("ProxyCommand '/opt/nono bin/nono' ssh-relay %h %p"));
+        assert!(
+            !config.contains("ssh-tunnel"),
+            "the raw tunnel route is gone: {config}"
+        );
         assert_eq!(
             files.git_ssh_command(),
             format!("ssh -F '{}'", files.config_path().display())
@@ -234,6 +302,42 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o400);
         }
+    }
+
+    /// The client must verify nono, and only nono: a key captured from one
+    /// session must be useless in the next.
+    #[test]
+    fn each_session_pins_a_fresh_host_key_the_client_must_verify() {
+        let (_dir, _env, _lock) = isolated_state();
+        let exe = PathBuf::from("/opt/nono/bin/nono");
+
+        let first = prepare_ssh_client_files(&exe).expect("prepare first session");
+        let config = std::fs::read_to_string(first.config_path()).expect("read config");
+        assert!(config.contains("StrictHostKeyChecking yes"));
+        assert!(config.contains("UserKnownHostsFile "));
+
+        let known_hosts_line = |files: &SshClientFiles| {
+            let path = std::fs::read_to_string(files.config_path())
+                .expect("read config")
+                .lines()
+                .find_map(|line| {
+                    line.trim()
+                        .strip_prefix("UserKnownHostsFile ")
+                        .map(|p| p.trim_matches('\'').to_string())
+                })
+                .expect("config names a known_hosts file");
+            std::fs::read_to_string(path).expect("read known_hosts")
+        };
+
+        let first_line = known_hosts_line(&first);
+        assert!(first_line.starts_with("* ssh-ed25519 "));
+
+        let second = prepare_ssh_client_files(&exe).expect("prepare second session");
+        assert_ne!(
+            first_line,
+            known_hosts_line(&second),
+            "a second session must present a different host key"
+        );
     }
 
     #[test]

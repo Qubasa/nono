@@ -88,7 +88,7 @@ pub(crate) struct DomainFilterIntent {
     /// Port-exact `host:port` SSH endpoints. Deliberately not
     /// `AllowDomainEntry`: these must reach the proxy allowlist without
     /// passing through `expand_proxy_allow`, which strips the port.
-    pub(crate) allow_ssh: Vec<String>,
+    pub(crate) allow_ssh: Vec<profile::AllowSshEntry>,
 }
 
 /// `WithEndpoints` allow-domain entries that require TLS interception so the
@@ -174,6 +174,9 @@ pub(crate) struct ProxyLaunchOptions {
     /// buffer. Set from `--no-audit`. Does not change filter, credentials,
     /// or fail-closed auth.
     pub(crate) audit_disabled: bool,
+    /// Private key the SSH mediation authenticates with, read in the parent.
+    /// `None` falls back to the ssh-agent at nono's own `SSH_AUTH_SOCK`.
+    pub(crate) ssh_key: Option<PathBuf>,
 }
 
 impl ProxyLaunchOptions {

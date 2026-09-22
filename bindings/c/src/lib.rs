@@ -108,7 +108,11 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         nono::NonoError::CwdPromptRequired => NonoErrorCode::ErrInvalidArg,
         nono::NonoError::SandboxInit(_) => NonoErrorCode::ErrSandboxInit,
         nono::NonoError::UnsupportedPlatform(_) => NonoErrorCode::ErrUnsupportedPlatform,
-        nono::NonoError::BlockedCommand { .. } => NonoErrorCode::ErrBlockedCommand,
+        // A mediation refusal is a policy decision, not transport trouble, so
+        // it shares a code with the other denials rather than with ErrIo.
+        nono::NonoError::BlockedCommand { .. } | nono::NonoError::SshBastion(_) => {
+            NonoErrorCode::ErrBlockedCommand
+        }
         #[cfg(target_os = "linux")]
         nono::NonoError::Landlock(_) | nono::NonoError::LandlockPath(_) => {
             NonoErrorCode::ErrSandboxInit
@@ -134,9 +138,7 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
             NonoErrorCode::ErrInvalidArg
         }
         nono::NonoError::VersionDowngrade { .. } => NonoErrorCode::ErrConfigParse,
-        nono::NonoError::Io(_)
-        | nono::NonoError::CommandExecution(_)
-        | nono::NonoError::SshTunnel(_) => NonoErrorCode::ErrIo,
+        nono::NonoError::Io(_) | nono::NonoError::CommandExecution(_) => NonoErrorCode::ErrIo,
         nono::NonoError::ObjectStore(_)
         | nono::NonoError::Snapshot(_)
         | nono::NonoError::AuditLedgerCorrupt { .. }

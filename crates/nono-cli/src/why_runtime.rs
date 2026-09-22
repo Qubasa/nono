@@ -65,30 +65,33 @@ fn resolve_denied_domains(profile: &profile::Profile) -> Result<Vec<String>> {
     ))
 }
 
-/// Resolve the port-exact SSH endpoints from a profile plus `--allow-ssh`.
-fn resolve_ssh_endpoints(profile: &profile::Profile, cli_entries: &[String]) -> Result<Vec<String>> {
+/// Resolve the port-exact SSH pins from a profile plus `--allow-ssh`.
+fn resolve_ssh_endpoints(
+    profile: &profile::Profile,
+    cli_entries: &[String],
+) -> Result<Vec<String>> {
     let mut entries = profile.network.allow_ssh.clone();
-    entries.extend(cli_entries.iter().cloned());
-    network_policy::ssh_allowlist_entries(&entries)
+    entries.extend(
+        cli_entries
+            .iter()
+            .map(|entry| profile::AllowSshEntry::Plain(entry.clone())),
+    );
+    network_policy::ssh_pin_authorities(&entries)
 }
 
 /// Merge `--allow-domain` overrides into a resolved allowlist.
 ///
-/// `ssh_endpoints` join it only when it is already filtering, mirroring
-/// `build_proxy_config_from_flags`: on an open policy the endpoints are pins
-/// alone, and writing them here would report SSH as the only reachable host.
+/// SSH endpoints deliberately never join it: the allowance grants a mediated
+/// session rather than reachability, so `host:22` is not in the proxy
+/// allowlist and `why` must report the same thing the filter enforces.
 fn merge_cli_allow_domains(
     mut domains: Vec<String>,
     cli_entries: &[String],
-    ssh_endpoints: &[String],
 ) -> Result<Vec<String>> {
     if !cli_entries.is_empty() {
         let policy_json = crate::config::embedded::embedded_network_policy_json();
         let net_policy = network_policy::load_network_policy(policy_json)?;
         domains.extend(network_policy::expand_proxy_allow(&net_policy, cli_entries));
-    }
-    if !domains.is_empty() {
-        domains.extend(ssh_endpoints.iter().cloned());
     }
     Ok(domains)
 }
@@ -219,11 +222,8 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         }
 
         let ssh_endpoints = resolve_ssh_endpoints(&profile, &args.allow_ssh)?;
-        let allowed_domains = merge_cli_allow_domains(
-            resolve_allowed_domains(&profile)?,
-            &args.allow_proxy,
-            &ssh_endpoints,
-        )?;
+        let allowed_domains =
+            merge_cli_allow_domains(resolve_allowed_domains(&profile)?, &args.allow_proxy)?;
         let denied_domains =
             merge_cli_deny_domains(resolve_denied_domains(&profile)?, &args.deny_proxy)?;
         let domain_endpoints = resolve_domain_endpoints(&profile);
@@ -266,13 +266,15 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             caps,
             deny_paths: prepared.deny_paths,
             overridden_paths: vec![],
-            allowed_domains: merge_cli_allow_domains(
-                Vec::new(),
-                &args.allow_proxy,
-                &[],
-            )?,
+            allowed_domains: merge_cli_allow_domains(Vec::new(), &args.allow_proxy)?,
             denied_domains: merge_cli_deny_domains(Vec::new(), &args.deny_proxy)?,
-            ssh_endpoints: network_policy::ssh_allowlist_entries(&args.allow_ssh)?,
+            ssh_endpoints: network_policy::ssh_pin_authorities(
+                &args
+                    .allow_ssh
+                    .iter()
+                    .map(|entry| profile::AllowSshEntry::Plain(entry.clone()))
+                    .collect::<Vec<_>>(),
+            )?,
             domain_endpoints: vec![],
             command_policies: None,
         }
@@ -759,7 +761,6 @@ mod tests {
         let allowed = merge_cli_allow_domains(
             resolve_allowed_domains(&profile).expect("resolve allowlist"),
             &[],
-            &ssh_endpoints,
         )
         .expect("merge allowlist");
         query_ext::query_network(
@@ -895,17 +896,15 @@ mod tests {
         );
     }
 
-    /// `why` must answer what the proxy enforces: on an open policy the SSH
-    /// port is closed everywhere but the pinned host, and nothing else moves.
+    /// `why` must answer what the proxy enforces: the SSH port is closed on
+    /// every host, the allowed endpoint included, and nothing else moves.
     #[test]
     fn profile_allow_ssh_pins_its_port_on_an_open_policy() {
         let config = r#"{"network":{"allow_ssh":["build.example.com"]}}"#;
-        assert!(
-            matches!(
-                why_profile_endpoint(config, "build.example.com", 22),
-                query_ext::QueryResult::Allowed { .. }
-            ),
-            "the pinned endpoint must stay reachable"
+        assert_eq!(
+            reason_of(&why_profile_endpoint(config, "build.example.com", 22)),
+            "ssh_mediated_only",
+            "the allowed endpoint is reached through the mediation, not as raw TCP"
         );
         assert_eq!(
             reason_of(&why_profile_endpoint(config, "other.example.com", 22)),
@@ -920,19 +919,36 @@ mod tests {
         );
     }
 
+    /// The refusal for the allowed endpoint has to say what to do instead,
+    /// or it reads as "this host is not allowed at all".
+    #[test]
+    fn the_allowed_endpoint_refusal_names_the_mediated_route() {
+        let config = r#"{"network":{"allow_ssh":["build.example.com"]}}"#;
+        let query_ext::QueryResult::Denied { details, .. } =
+            why_profile_endpoint(config, "build.example.com", 22)
+        else {
+            panic!("raw TCP to the allowed endpoint must be denied");
+        };
+        let details = details.expect("a refusal must explain itself");
+        assert!(
+            details.contains("mediated SSH session") && details.contains("-L"),
+            "the refusal must name the route and what it refuses: {details}"
+        );
+    }
+
     /// An allowlist that is already filtering keeps its own refusals, and the
-    /// SSH host reaches only its own port.
+    /// SSH allowance never widens it.
     #[test]
     fn profile_allow_ssh_beside_allow_domain_stays_port_exact() {
         let config =
             r#"{"network":{"allow_domain":["api.example.com"],"allow_ssh":["build.example.com"]}}"#;
         assert_eq!(
             reason_of(&why_profile_endpoint(config, "build.example.com", 22)),
-            "proxy_allowed"
+            "ssh_mediated_only"
         );
         assert_eq!(
             reason_of(&why_profile_endpoint(config, "build.example.com", 443)),
-            "port_not_allowed"
+            "proxy_filtered"
         );
         assert_eq!(
             reason_of(&why_profile_endpoint(config, "evil.example.com", 443)),

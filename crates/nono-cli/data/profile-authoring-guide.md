@@ -362,7 +362,7 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 | `allow_http2`           | boolean                           | `false`  | Allow HTTP/2 to upstream servers via ALPN negotiation. Default is HTTP/1.1 with keep-alive. Equivalent to `--allow-http2`. |
 | `network_profile`       | string or null                    | inherit  | Name from `network-policy.json` for proxy filtering. Set to `null` to clear inherited value. |
 | `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Supports wildcard subdomains (`*.googleapis.com`) and a whole-label wildcard in a non-leading position (`jenkins.*.ci.example.com`, matching exactly one label there). |
-| `allow_ssh`             | array of string                   | `[]`     | SSH endpoints the sandbox may reach, written as `[user@]host[:port]`. The port defaults to 22 and any `user@` prefix is accepted and ignored, so a target copied from a shell command pastes verbatim; IPv6 literals must be bracketed (`[::1]:22`). Entries are **port-exact**: `build.example.com` permits `build.example.com:22` and refuses `build.example.com:443`. This is the difference from `allow_domain`, which strips any `:port` suffix and grants the host on every port. Wildcards (`*.example.com`), an empty host, a non-numeric port, and a port outside 1–65535 are rejected at load time, and the error names the offending entry. Activates proxy mode on its own. Equivalent to `--allow-ssh`. |
+| `allow_ssh`             | array of string or object         | `[]`     | SSH endpoints the sandbox may reach as a **mediated SSH session**: the sandboxed client speaks SSH to nono, and nono opens its own session to the endpoint and relays it channel by channel. The endpoint is never reachable as raw TCP, so `CONNECT host:22` is refused even on an allowed host. Entries are `[user@]host[:port]`, or the object form described below; both mix freely in one list. The port defaults to 22 and IPv6 literals must be bracketed (`[::1]:22`). The `user@` prefix names the remote user **nono** authenticates as; with no prefix, nono uses the username it runs as. It has no effect on which endpoints are reachable, and the sandbox cannot choose the remote identity. Entries are **port-exact**: `build.example.com` permits `build.example.com:22` and refuses `build.example.com:443`. This is the difference from `allow_domain`, which strips any `:port` suffix and grants the host on every port. Only `session` channels run (`shell`, `exec`, `pty-req`, `window-change`, `subsystem`, `signal`); `direct-tcpip` (`-L`, `-D`, `-J`), `tcpip-forward` (`-R`), `auth-agent-req@openssh.com` (`-A`) and `x11-req` are refused with the request type named. nono authenticates with `--ssh-key` or the host's `SSH_AUTH_SOCK` outside the sandbox and verifies the endpoint's host key against the user's `known_hosts`, so no key or agent grant is needed inside the sandbox. Wildcards (`*.example.com`), an empty host, a non-numeric port, and a port outside 1–65535 are rejected at load time, and the error names the offending entry. Activates proxy mode on its own. Equivalent to `--allow-ssh`. |
 | `deny_domain`           | array of string                   | `[]`     | Domains to block through the proxy regardless of the allowlist. Evaluated before `allow_domain`. Supports the same wildcard grammar as `allow_domain` (`*.ads.example.com`, `jenkins.*.ci.example.com`). Equivalent to `--deny-domain`. |
 | `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. |
 | `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC (connect + bind). Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
@@ -414,6 +414,37 @@ When an `allow_domain` entry is an object with `endpoints`, the proxy performs T
 Each endpoint rule has `method` (HTTP method or `"*"` for any) and `path` (glob pattern: `*` = one segment, `**` = zero or more segments).
 
 When profiles extend each other, endpoint rules for the same domain are **appended** (merged), not replaced. Proxy mode is automatically enabled when endpoint rules are present.
+
+#### allow_ssh with a command allowlist
+
+An `allow_ssh` entry written as an object names the exact commands its endpoint may run:
+
+```json
+{
+  "network": {
+    "allow_ssh": [
+      "git@build.example.com",
+      {
+        "endpoint": "git@deploy.example.com",
+        "commands": ["git-upload-pack /srv/repo.git"]
+      }
+    ]
+  }
+}
+```
+
+| Field      | Type   | Required | Description |
+|------------|--------|----------|-------------|
+| `endpoint` | string | yes      | Same `[user@]host[:port]` syntax as a plain string entry. |
+| `commands` | array  | yes      | Exact command lines the endpoint may run. An empty list is a load error. |
+
+Matching is exact on the tokenised argument vector, after quote-aware POSIX word splitting of both the rule and the request, so `git-upload-pack '/srv/repo.git'` and `git-upload-pack /srv/repo.git` are the same rule. There is no prefix matching, no globbing and no argument templating.
+
+A requested command carrying shell metacharacters (`;`, `|`, `&`, `$`, a backtick, `(`, `)`, `<`, `>`, `{`, `}`, or a newline) is refused before matching is attempted, because the remote shell interprets that string and nono cannot.
+
+An endpoint that carries a command list is a task endpoint, not a login: `shell`, `pty-req` and `subsystem` are refused there. An entry with no command list keeps the default session behavior.
+
+The example allows `git fetch` from `deploy.example.com` and refuses `git push`: a fetch runs `git-upload-pack /srv/repo.git`, a push runs `git-receive-pack /srv/repo.git`, and only the first is named. The allowlist bounds which commands **start**. Bounding what an allowed command then does is the remote host's job, with `authorized_keys` `restrict` or `command=`.
 
 #### custom_credentials entry
 

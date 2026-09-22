@@ -527,7 +527,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) rollback_exclude_globs: Vec<String>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
-    pub(crate) allow_ssh: Vec<String>,
+    pub(crate) allow_ssh: Vec<profile::AllowSshEntry>,
     pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,

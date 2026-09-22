@@ -3,9 +3,15 @@
 ### Requirement: An SSH allowance names one endpoint and is port-exact
 
 An SSH allowance MUST be expressed as `[user@]host[:port]`, where the port
-defaults to 22 and any `user@` prefix is accepted and ignored, so an SSH target
-copied from a shell command can be pasted verbatim. The allowance MUST permit
-that host on that port only.
+defaults to 22, so an SSH target copied from a shell command can be pasted
+verbatim. The allowance MUST permit that host on that port only.
+
+The `user@` prefix MUST name the remote identity the mediation authenticates
+as. A sandboxed client MUST NOT be able to select a different remote identity,
+whatever user name it asks for, because the credential is held outside the
+sandbox and the mediation chooses which identity to present with it. An
+allowance that names no user MUST authenticate as the user nono itself runs as,
+matching what a bare `ssh host` would send.
 
 An allowance MAY instead be written as an object naming the same endpoint plus
 the exact commands that endpoint may run. Both forms MUST be accepted in the
@@ -27,17 +33,34 @@ allowances emit, because the port is not ignored.
 - **THEN** a session to port 2222 is established, and a session to port 22 on
   the same host is refused
 
+#### Scenario: The allowance names the remote user
+
+- **WHEN** a profile allows SSH to `deploy@build.example.com:2222`
+- **THEN** the session on that endpoint authenticates as `deploy`
+
+#### Scenario: The client asks for a different user
+
+- **WHEN** a profile allows SSH to `deploy@build.example.com` and a sandboxed
+  process runs `ssh root@build.example.com`
+- **THEN** the session still authenticates as `deploy`, because the remote
+  identity is the allowance's and not the client's
+
+#### Scenario: Allowance without a user
+
+- **WHEN** a profile allows SSH to `build.example.com` with no user prefix
+- **THEN** the session authenticates as the user nono runs as
+
 #### Scenario: SSH target pasted with a user prefix
 
 - **WHEN** a profile allows SSH to `deploy@build.example.com:2222`
-- **THEN** the allowance is equivalent to `build.example.com:2222`, and the
-  user name has no effect on which endpoints are reachable
+- **THEN** the entry parses and pins `build.example.com:2222`, and the user
+  prefix now selects the remote identity instead of being discarded
 
 #### Scenario: A second host is not reachable
 
 - **WHEN** a profile allows SSH to `build.example.com` only
 - **THEN** a session to any other host on port 22 is refused with a message
-  naming the host and stating it is not in the allowlist
+  naming the host and stating it is not allowed
 
 #### Scenario: No port-ignored warning
 

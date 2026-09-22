@@ -55,6 +55,11 @@ hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
 
+# SSH bastion (client + server halves). `ring` rather than the default
+# `aws-lc-rs` backend: rustls already links ring, so this adds no third
+# crypto stack. `rsa` keeps older servers and RSA agent keys usable.
+russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa", "flate2"] }
+
 # Testing
 tempfile = "3"
 

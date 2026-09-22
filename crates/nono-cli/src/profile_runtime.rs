@@ -29,7 +29,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) rollback_exclude_globs: Vec<String>,
     pub(crate) network_profile: Option<String>,
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
-    pub(crate) allow_ssh: Vec<String>,
+    pub(crate) allow_ssh: Vec<profile::AllowSshEntry>,
     pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
@@ -1887,7 +1887,12 @@ echo hi
         assert_eq!(runtime.network_profile, preflight.network_profile);
         assert_eq!(runtime.allow_domain, preflight.allow_domain);
         assert_eq!(runtime.allow_ssh, preflight.allow_ssh);
-        assert_eq!(runtime.allow_ssh, vec!["deploy@build.example.com:2222"]);
+        assert_eq!(
+            runtime.allow_ssh,
+            vec![profile::AllowSshEntry::Plain(
+                "deploy@build.example.com:2222".to_string()
+            )]
+        );
         assert_eq!(runtime.credentials, preflight.credentials);
         assert_eq!(runtime.custom_credentials, preflight.custom_credentials);
         assert_eq!(runtime.no_proxy, preflight.no_proxy);

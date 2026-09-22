@@ -96,6 +96,7 @@ tempfile.workspace = true
 vt100 = "0.16.2"
 shlex = "2"
 jsonc-parser = { version = "0.33", features = ["serde"] }
+russh.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "term", "dir"] }

@@ -190,6 +190,41 @@ fn test_schema_rejects_nested_extends_in_platform_overrides() {
 }
 
 #[test]
+fn test_schema_validates_both_allow_ssh_forms() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": {
+            "allow_ssh": [
+                "deploy@build.example.com:2222",
+                { "endpoint": "git@code.example.com", "commands": ["git-upload-pack /srv/repo.git"] }
+            ]
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("a plain endpoint and a command-restricted endpoint must both validate");
+}
+
+#[test]
+fn test_schema_rejects_allow_ssh_object_without_commands() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": {
+            "allow_ssh": [{ "endpoint": "git@code.example.com" }]
+        }
+    });
+
+    assert!(
+        validator.validate(&profile).is_err(),
+        "the object form exists to carry a command list; omitting it must fail \
+         schema validation rather than silently mean 'no restriction'"
+    );
+}
+
+#[test]
 fn test_schema_rejects_nested_platform_overrides_in_platform_overrides() {
     let schema = load_schema();
     let validator = jsonschema::validator_for(&schema).expect("schema compiles");

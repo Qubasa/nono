@@ -234,7 +234,10 @@ fn check_domain_allow(
     port: u16,
 ) -> nono::net_filter::FilterResult {
     let result = filter.check_host(domain, &[]);
-    if !matches!(result, nono::net_filter::FilterResult::DenyNotAllowed { .. }) {
+    if !matches!(
+        result,
+        nono::net_filter::FilterResult::DenyNotAllowed { .. }
+    ) {
         return result;
     }
     filter.check_host(&host_authority(domain, port), &[])
@@ -322,25 +325,18 @@ pub struct NetworkPolicyView<'a> {
     pub domain_endpoints: &'a [crate::sandbox_state::DomainEndpointState],
 }
 
-/// Whether the SSH pins refuse this authority: the port is pinned and this
-/// host is not one of the hosts it is pinned to. Mirrors `SshPins::denies`
-/// in `nono-proxy/src/filter.rs`.
-fn ssh_pin_denies(ssh_endpoints: &[String], domain: &str, port: u16) -> bool {
-    let authority = host_authority(domain, port);
-    let mut port_is_pinned = false;
-    for entry in ssh_endpoints {
-        let Some((_, entry_port)) = split_entry_port(entry) else {
-            continue;
-        };
-        if entry_port != port {
-            continue;
-        }
-        port_is_pinned = true;
-        if entry.eq_ignore_ascii_case(&authority) {
-            return false;
-        }
-    }
-    port_is_pinned
+/// Whether the SSH pins refuse this authority.
+///
+/// Every host on a pinned port is refused now, the allowed endpoint included:
+/// the allowance grants a mediated SSH session rather than reachability, so
+/// there is no host for which raw TCP to that port succeeds. Mirrors
+/// `SshPins::denies` in `nono-proxy/src/filter.rs` plus the absence of the
+/// endpoint from the allowlist.
+fn ssh_pin_denies(ssh_endpoints: &[String], _domain: &str, port: u16) -> bool {
+    ssh_endpoints
+        .iter()
+        .filter_map(|entry| split_entry_port(entry))
+        .any(|(_, entry_port)| entry_port == port)
 }
 
 /// Split a `host:port` allowlist entry, tolerating a bracketed IPv6 literal.
@@ -352,23 +348,52 @@ fn split_entry_port(entry: &str) -> Option<(&str, u16)> {
     Some((host, port.parse().ok()?))
 }
 
-/// The refusal a pinned port produces for a host it is not pinned to.
+/// The refusal a pinned port produces.
+///
+/// The allowed endpoint and any other host are both refused, for different
+/// reasons, and saying which is the difference between "use ssh, it works"
+/// and "this host is not allowed at all".
 fn ssh_pin_denied_result(ssh_endpoints: &[String], domain: &str, port: u16) -> QueryResult {
+    let authority = host_authority(domain, port);
     let pinned: Vec<&str> = ssh_endpoints
         .iter()
         .filter(|e| split_entry_port(e).is_some_and(|(_, p)| p == port))
         .map(String::as_str)
         .collect();
-    QueryResult::Denied {
-        reason: "ssh_port_pinned".to_string(),
-        details: Some(format!(
+    let is_allowed_endpoint = pinned
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(&authority));
+
+    let details = if is_allowed_endpoint {
+        format!(
+            "{authority} is an allowed SSH endpoint, but the allowance grants a mediated SSH \
+             session and not raw reachability, so a direct connection is refused. Use ssh or \
+             git: nono terminates the session, authenticates outside the sandbox, and relays \
+             session channels only. Port forwarding (-L, -R, -D, -J), agent forwarding (-A) \
+             and X11 forwarding are refused inside it."
+        )
+    } else {
+        format!(
             "Port {port} is pinned by network.allow_ssh to {}. \
              {domain}:{port} is refused; other ports on {domain} are unaffected.",
             pinned.join(", ")
-        )),
-        policy_source: Some("proxy SSH pin (network.allow_ssh)".to_string()),
+        )
+    };
+
+    QueryResult::Denied {
+        reason: if is_allowed_endpoint {
+            "ssh_mediated_only".to_string()
+        } else {
+            "ssh_port_pinned".to_string()
+        },
+        details: Some(details),
+        policy_source: Some("SSH mediation (network.allow_ssh)".to_string()),
         matching_capability: None,
-        suggested_flag: Some(format!("--allow-ssh {domain}:{port}")),
+        suggested_flag: if is_allowed_endpoint {
+            None
+        } else {
+            Some(format!("--allow-ssh {domain}:{port}"))
+        },
         endpoint_rules: None,
     }
 }
@@ -1285,24 +1310,34 @@ mod tests {
     #[test]
     fn test_query_network_allowed() {
         let caps = CapabilitySet::new();
-        let result = query_network("example.com", 443, &caps, NetworkPolicyView {
-            allowed_domains: &[],
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        });
+        let result = query_network(
+            "example.com",
+            443,
+            &caps,
+            NetworkPolicyView {
+                allowed_domains: &[],
+                denied_domains: &[],
+                ssh_endpoints: &[],
+                domain_endpoints: &[],
+            },
+        );
         assert!(matches!(result, QueryResult::Allowed { .. }));
     }
 
     #[test]
     fn test_query_network_blocked() {
         let caps = CapabilitySet::new().block_network();
-        let result = query_network("example.com", 443, &caps, NetworkPolicyView {
-            allowed_domains: &[],
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        });
+        let result = query_network(
+            "example.com",
+            443,
+            &caps,
+            NetworkPolicyView {
+                allowed_domains: &[],
+                denied_domains: &[],
+                ssh_endpoints: &[],
+                domain_endpoints: &[],
+            },
+        );
         assert!(matches!(result, QueryResult::Denied { .. }));
     }
 
@@ -1334,20 +1369,30 @@ mod tests {
         });
         let allowed = vec!["api.example.com".to_string()];
 
-        let result = query_network("api.example.com", 443, &caps, NetworkPolicyView {
-            allowed_domains: &allowed,
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        });
+        let result = query_network(
+            "api.example.com",
+            443,
+            &caps,
+            NetworkPolicyView {
+                allowed_domains: &allowed,
+                denied_domains: &[],
+                ssh_endpoints: &[],
+                domain_endpoints: &[],
+            },
+        );
         assert!(matches!(result, QueryResult::Allowed { .. }));
 
-        match query_network("evil.com", 443, &caps, NetworkPolicyView {
-            allowed_domains: &allowed,
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        }) {
+        match query_network(
+            "evil.com",
+            443,
+            &caps,
+            NetworkPolicyView {
+                allowed_domains: &allowed,
+                denied_domains: &[],
+                ssh_endpoints: &[],
+                domain_endpoints: &[],
+            },
+        ) {
             QueryResult::Denied {
                 reason,
                 suggested_flag,
@@ -1369,22 +1414,32 @@ mod tests {
         let allowed = vec!["*.example.com".to_string()];
 
         assert!(matches!(
-            query_network("sub.example.com", 443, &caps, NetworkPolicyView {
-            allowed_domains: &allowed,
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        }),
+            query_network(
+                "sub.example.com",
+                443,
+                &caps,
+                NetworkPolicyView {
+                    allowed_domains: &allowed,
+                    denied_domains: &[],
+                    ssh_endpoints: &[],
+                    domain_endpoints: &[],
+                }
+            ),
             QueryResult::Allowed { .. }
         ));
         // *.example.com must NOT match bare example.com (mirrors HostFilter)
         assert!(matches!(
-            query_network("example.com", 443, &caps, NetworkPolicyView {
-            allowed_domains: &allowed,
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        }),
+            query_network(
+                "example.com",
+                443,
+                &caps,
+                NetworkPolicyView {
+                    allowed_domains: &allowed,
+                    denied_domains: &[],
+                    ssh_endpoints: &[],
+                    domain_endpoints: &[],
+                }
+            ),
             QueryResult::Denied { .. }
         ));
     }
@@ -1396,12 +1451,17 @@ mod tests {
             bind_ports: vec![],
         });
         assert!(matches!(
-            query_network("anything.com", 443, &caps, NetworkPolicyView {
-            allowed_domains: &[],
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        }),
+            query_network(
+                "anything.com",
+                443,
+                &caps,
+                NetworkPolicyView {
+                    allowed_domains: &[],
+                    denied_domains: &[],
+                    ssh_endpoints: &[],
+                    domain_endpoints: &[],
+                }
+            ),
             QueryResult::Allowed { .. }
         ));
     }
@@ -1414,23 +1474,33 @@ mod tests {
         });
         // Cloud metadata endpoints are denied even with an empty allowlist
         assert!(matches!(
-            query_network("169.254.169.254", 80, &caps, NetworkPolicyView {
-            allowed_domains: &[],
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        }),
+            query_network(
+                "169.254.169.254",
+                80,
+                &caps,
+                NetworkPolicyView {
+                    allowed_domains: &[],
+                    denied_domains: &[],
+                    ssh_endpoints: &[],
+                    domain_endpoints: &[],
+                }
+            ),
             QueryResult::Denied { .. }
         ));
         // Also denied even if explicitly in the allowlist
         let allowed = vec!["169.254.169.254".to_string()];
         assert!(matches!(
-            query_network("169.254.169.254", 80, &caps, NetworkPolicyView {
-            allowed_domains: &allowed,
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        }),
+            query_network(
+                "169.254.169.254",
+                80,
+                &caps,
+                NetworkPolicyView {
+                    allowed_domains: &allowed,
+                    denied_domains: &[],
+                    ssh_endpoints: &[],
+                    domain_endpoints: &[],
+                }
+            ),
             QueryResult::Denied { .. }
         ));
     }
@@ -1456,12 +1526,17 @@ mod tests {
         ));
         // Different port on the same host is unaffected by a port-scoped deny.
         assert!(matches!(
-            query_network("::1", 8787, &caps, NetworkPolicyView {
-            allowed_domains: &allowed,
-            denied_domains: &denied,
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        }),
+            query_network(
+                "::1",
+                8787,
+                &caps,
+                NetworkPolicyView {
+                    allowed_domains: &allowed,
+                    denied_domains: &denied,
+                    ssh_endpoints: &[],
+                    domain_endpoints: &[],
+                }
+            ),
             QueryResult::Allowed { .. }
         ));
     }
@@ -1475,12 +1550,17 @@ mod tests {
         let allowed = vec!["github.com".to_string()];
         // Full URL should extract domain and match
         assert!(matches!(
-            query_network("https://github.com/some/repo", 443, &caps, NetworkPolicyView {
-            allowed_domains: &allowed,
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &[],
-        }),
+            query_network(
+                "https://github.com/some/repo",
+                443,
+                &caps,
+                NetworkPolicyView {
+                    allowed_domains: &allowed,
+                    denied_domains: &[],
+                    ssh_endpoints: &[],
+                    domain_endpoints: &[],
+                }
+            ),
             QueryResult::Allowed { .. }
         ));
     }
@@ -1506,12 +1586,17 @@ mod tests {
             ],
         }];
         // Path that matches a rule
-        let result = query_network("https://github.com/atko-cic/repo", 443, &caps, NetworkPolicyView {
-            allowed_domains: &allowed,
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &endpoints,
-        });
+        let result = query_network(
+            "https://github.com/atko-cic/repo",
+            443,
+            &caps,
+            NetworkPolicyView {
+                allowed_domains: &allowed,
+                denied_domains: &[],
+                ssh_endpoints: &[],
+                domain_endpoints: &endpoints,
+            },
+        );
         assert!(matches!(result, QueryResult::Allowed { .. }));
     }
 
@@ -1530,12 +1615,17 @@ mod tests {
             }],
         }];
         // Path that does NOT match any rule
-        let result = query_network("https://github.com/openai/codex", 443, &caps, NetworkPolicyView {
-            allowed_domains: &allowed,
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &endpoints,
-        });
+        let result = query_network(
+            "https://github.com/openai/codex",
+            443,
+            &caps,
+            NetworkPolicyView {
+                allowed_domains: &allowed,
+                denied_domains: &[],
+                ssh_endpoints: &[],
+                domain_endpoints: &endpoints,
+            },
+        );
         match result {
             QueryResult::Denied {
                 reason,
@@ -1572,12 +1662,17 @@ mod tests {
             }],
         }];
         // Bare domain (no path) shows allowed with endpoint rules
-        let result = query_network("github.com", 443, &caps, NetworkPolicyView {
-            allowed_domains: &allowed,
-            denied_domains: &[],
-            ssh_endpoints: &[],
-            domain_endpoints: &endpoints,
-        });
+        let result = query_network(
+            "github.com",
+            443,
+            &caps,
+            NetworkPolicyView {
+                allowed_domains: &allowed,
+                denied_domains: &[],
+                ssh_endpoints: &[],
+                domain_endpoints: &endpoints,
+            },
+        );
         match result {
             QueryResult::Allowed {
                 endpoint_rules,

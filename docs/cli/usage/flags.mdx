@@ -397,22 +397,45 @@ When a URL with a path is provided, only requests matching that path pattern are
 
 #### `--allow-ssh`
 
-Allow SSH to one endpoint through the proxy, written as `[user@]host[:port]`. Can be specified multiple times. Port-exact: the port defaults to 22 and no other port on that host is opened, unlike `--allow-domain`. Activates proxy mode if not already active.
+Allow SSH to one endpoint, written as `[user@]host[:port]`. Can be specified multiple times. Port-exact: the port defaults to 22 and no other port on that host is opened, unlike `--allow-domain`. Activates proxy mode if not already active.
+
+The route is a mediated SSH session, not a tunnel. The sandboxed client speaks SSH to nono over a session-scoped unix socket, and nono opens its own SSH session to the endpoint and relays it channel by channel. The endpoint is not reachable as raw TCP: `CONNECT build.example.com:22` is refused on the allowed host just as it is everywhere else.
+
+Only `session` channels run, which means `shell`, `exec`, `pty-req`, `window-change`, `subsystem` and `signal`. Every forwarding request is refused with the request type named: `direct-tcpip` (`-L`, `-D`, `-J`), `tcpip-forward` (`-R`), `auth-agent-req@openssh.com` (`-A`) and `x11-req` (`-X`, `-Y`). `sftp`, `scp` and `rsync -e ssh` keep working, because each is a subsystem or a remote command.
+
+The `user@` prefix names the remote user nono authenticates as; without one, nono uses the username it runs as, exactly as a plain `ssh host` would. The sandbox does not choose the remote identity, so under `--allow-ssh deploy@build.example.com` a sandboxed `ssh root@build.example.com` still runs as `deploy`.
+
+nono authenticates from outside the sandbox, with `--ssh-key` or the host's `SSH_AUTH_SOCK`, and checks the endpoint's host key against your `~/.ssh/known_hosts` itself. The sandbox needs no grant for a key file or an agent socket.
 
 ```bash
 # Allow git over SSH to one build host (port 22)
 nono run --allow-cwd --allow-ssh build.example.com -- git fetch
 
-# Non-default port; any user@ prefix is accepted and ignored. `ssh` has to be
+# Non-default port; the user@ prefix picks the remote user. `ssh` has to be
 # resolved inside the sandbox to pick up the generated config, so go through a
 # shell: a top-level `-- ssh …` is resolved against the host PATH beforehand.
 nono run --allow-cwd --allow-ssh deploy@other.example.com:2222 \
-  -- sh -c 'ssh -p 2222 deploy@other.example.com'
+  -- sh -c 'ssh -p 2222 other.example.com'
 ```
+
+In a profile an entry may instead be an object carrying a `commands` list, which restricts that endpoint to those exact command lines and refuses `shell`, `pty-req` and `subsystem` there. See [Per-Endpoint Command Allowlist](/cli/features/networking#per-endpoint-command-allowlist).
 
 Wildcards (`*.example.com`), an empty host, and a port outside 1–65535 are rejected. Incompatible with `--block-net` and `--allow-net`, both of which remove the proxy that pins the destination. Also accepted by `nono shell`, `nono proxy`, and `nono why`. See [SSH Egress Pinning](/cli/features/networking#ssh-egress-pinning).
 
 Environment variable: `NONO_ALLOW_SSH`
+
+#### `--ssh-key`
+
+Path to a private key file nono authenticates `--allow-ssh` endpoints with, instead of the agent at its own `SSH_AUTH_SOCK`. nono reads and parses the key in the parent process before the sandbox is built, so the file never enters the sandbox and needs no read grant.
+
+```bash
+nono run --allow-cwd --allow-ssh git@build.example.com \
+  --ssh-key ~/.ssh/id_build -- git fetch
+```
+
+An encrypted key file, a hardware-backed `sk-*` key, or a certificate file fails at startup with an error naming the file and pointing at `ssh-add`, rather than prompting for a passphrase or failing mid-session. The flag applies only to endpoints allowed with `--allow-ssh`.
+
+Environment variable: `NONO_SSH_KEY`
 
 #### `--deny-domain`
 
@@ -1611,6 +1634,7 @@ CLI flags always take precedence over environment variables.
 | `--network-profile` | `NONO_NETWORK_PROFILE` | `NONO_NETWORK_PROFILE=claude-code` |
 | `--allow-domain` | `NONO_ALLOW_DOMAIN` | `NONO_ALLOW_DOMAIN=api.openai.com` |
 | `--allow-ssh` | `NONO_ALLOW_SSH` | `NONO_ALLOW_SSH=build.example.com` |
+| `--ssh-key` | `NONO_SSH_KEY` | `NONO_SSH_KEY=~/.ssh/id_build` |
 | `--credential` | `NONO_CREDENTIAL` | `NONO_CREDENTIAL=openai` |
 | `--env-credential` | `NONO_ENV_CREDENTIAL` | `NONO_ENV_CREDENTIAL=key1,key2` |
 | `--capability-elevation` | `NONO_CAPABILITY_ELEVATION` | `NONO_CAPABILITY_ELEVATION=true` |

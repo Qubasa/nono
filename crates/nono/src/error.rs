@@ -203,8 +203,8 @@ pub enum NonoError {
     #[error("Per-port network filtering not supported on {platform}: {reason}")]
     NetworkFilterUnsupported { platform: String, reason: String },
 
-    #[error("SSH tunnel failed: {0}")]
-    SshTunnel(String),
+    #[error("{0}")]
+    SshBastion(String),
 
     // I/O errors
     #[error("I/O error: {0}")]
@@ -281,9 +281,10 @@ impl NonoError {
             | Self::AuditLedgerCorrupt { .. }
             | Self::ObjectStore(_)
             | Self::Snapshot(_) => NonoDiagnosticCode::Other,
-            // The tunnel only fails after the proxy has refused the CONNECT,
-            // so the cause is the network policy, not the config that set it.
-            Self::SshTunnel(_) => NonoDiagnosticCode::SandboxDeniedNetwork,
+            // Everything the mediation refuses is a network-policy decision:
+            // an endpoint no allowance covers, a request the channel policy
+            // rejects, or a host key the user has not verified.
+            Self::SshBastion(_) => NonoDiagnosticCode::SandboxDeniedNetwork,
             #[cfg(target_os = "linux")]
             Self::Landlock(_) | Self::LandlockPath(_) => NonoDiagnosticCode::SandboxDeniedPath,
         }

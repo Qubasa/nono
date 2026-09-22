@@ -319,25 +319,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         plain_domain_strs
     };
     // The pins are state of their own: they close a port everywhere else, so
-    // they are not allowlist entries. They still join the allowlist when one
-    // is active, matching `build_proxy_config_from_flags`, so `why --self`
-    // answers exactly what the proxy enforces.
+    // they are not allowlist entries and never join the allowlist. The
+    // endpoint itself is reached through the bastion, not the proxy.
     let ssh_endpoint_strs: Vec<String> = {
         let entries = domain_filter.map(|d| d.allow_ssh.as_slice()).unwrap_or(&[]);
-        match network_policy::ssh_allowlist_entries(entries) {
+        match network_policy::ssh_pin_authorities(entries) {
             Ok(entries) => entries,
             Err(e) => {
                 warn!("failed to resolve allow_ssh entries for sandbox state: {e}");
                 Vec::new()
             }
         }
-    };
-    let allowed_domain_strs: Vec<String> = {
-        let mut domains = allowed_domain_strs;
-        if !domains.is_empty() {
-            domains.extend(ssh_endpoint_strs.iter().cloned());
-        }
-        domains
     };
     // Expand `deny_domain` the same way for `nono why --self`.
     let denied_domain_strs: Vec<String> = domain_filter
@@ -423,6 +415,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let tool_sandbox_trust_bundle_paths = active_proxy.tool_sandbox_trust_bundle_paths;
     let proxy_handle = active_proxy.handle;
     let ssh_client = active_proxy.ssh_client;
+    let ssh_bastion = active_proxy.ssh_bastion;
 
     let requested_workdir =
         flags
@@ -879,6 +872,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             // supervised-mode session leaks files + directories.
             drop(proxy_handle);
             drop(ssh_client);
+            drop(ssh_bastion);
             crate::tool_sandbox::log_main_total();
             std::process::exit(exit_code);
         }

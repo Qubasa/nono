@@ -635,12 +635,7 @@ Tool Sandbox supports two credential types:
 | `local-socket` | Grant one selected child access to a local IPC socket and optionally map it into an env var |
 | `raw-file` | Grant direct-session tools exact read access to a file credential |
 
-A Git profile can model SSH agent as a local socket credential. Reaching the SSH
-endpoint itself is a separate, network-side grant: use `network.allow_ssh`
-(`--allow-ssh`), which allows one `[user@]host[:port]` endpoint through the
-proxy. It is host- and port-exact, with the port defaulting to 22, and it is
-enforced by the proxy destination pin rather than by Landlock's port-only
-`AccessNet`, so it works the same on macOS and Linux:
+A Git profile can model SSH agent as a local socket credential:
 
 ```json
 {
@@ -655,6 +650,16 @@ enforced by the proxy destination pin rather than by Landlock's port-only
 }
 ```
 
+Reaching an SSH endpoint does not need that grant. `network.allow_ssh`
+(`--allow-ssh`) allows one `[user@]host[:port]` endpoint as a mediated SSH
+session: the client's session terminates at nono, which authenticates to the
+endpoint itself with `--ssh-key` or the host's `SSH_AUTH_SOCK` and relays only
+`session` channels. It is host- and port-exact, with the port defaulting to 22,
+and it is enforced by the proxy destination pin rather than by Landlock's
+port-only `AccessNet`, so it works the same on macOS and Linux. Granting the
+agent socket into the sandbox as well is redundant, and nono warns about it,
+because an agent the sandbox can reach signs for every key it holds.
+
 Under Tool Sandbox the generated `ssh` PATH wrapper is not installed, because
 the shim directory owns `ssh` on `PATH`; `GIT_SSH_COMMAND` still points git at
 the generated config, and an `ssh` governed by `command_policies` keeps going
@@ -665,9 +670,10 @@ such as `"$XDG_RUNTIME_DIR/sccache.sock"`. Variables are expanded anywhere in
 the string; if a referenced variable is unset, a command that selects the 
 credential fails before launch with a Tool Sandbox error naming the variable.
 
-The agent socket keeps private keys out of the sandbox, but the agent can sign
-for every key it holds. To narrow that, grant one dedicated key with
-`filesystem.read_file` and configure the client with `IdentitiesOnly=yes`. See
+An agent socket granted this way keeps private keys out of the sandbox, but the
+agent can sign for every key it holds. Under `allow_ssh` there is nothing left
+to narrow: no key file and no agent socket exists inside the sandbox, and the
+endpoint the credential could be used against is fixed by the allowance. See
 [SSH Egress Pinning](/cli/features/networking#ssh-egress-pinning).
 
 ### Shaping an ambient credential's phantom
@@ -833,8 +839,8 @@ nono run --profile my-eti-profile -- "$REAL" --version
 | `nono: Tool Sandbox denied <cmd>: missing session sandbox` | The outer session invoked a policy command without `commands.<name>.sandbox` or `commands.<name>.from.session`. |
 | `nono: Tool Sandbox denied <cmd>: missing from.<caller>` | A caller was allowed to invoke a callee name, but the callee has no `from.<caller>` policy. |
 | `Tool Sandbox credential '<name>' is unavailable: SSH_AUTH_SOCK is unset` | The selected policy references a local-socket credential backed by `SSH_AUTH_SOCK`, but no agent socket was available at session startup. |
-| `Permission denied (publickey)` | SSH reached the remote server; authentication failed outside nono. |
-| `Host key verification failed` | SSH could not verify the host from the known-hosts files the policy grants. |
+| `Permission denied (publickey)` | Under `allow_ssh`, nono reached the remote server and the credential it holds outside the sandbox was rejected. |
+| `Host key verification failed` | The client inside the sandbox rejected nono's per-session host key. A refusal of the *remote* endpoint's key happens outside the sandbox and names the endpoint instead. |
 | `Tool Sandbox exec failed for script ... using interpreter ...` | The command resolved to a shebang script. Grant the required interpreter, package, and runtime data paths explicitly. |
 | `Tool Sandbox direct exec bypass denied` | A policy-controlled command was invoked by absolute path instead of through its shim. |
 | `Seatbelt cannot enforce raw per-port TCP rules for Tool Sandbox children` | The selected Tool Sandbox policy uses raw TCP port filters on macOS. Use a Linux host or a proxy-backed policy instead. |

@@ -3,7 +3,7 @@
 //! Parses `network-policy.json` and resolves named groups into flat host
 //! lists and credential route configurations for the proxy.
 
-use crate::profile::CustomCredentialDef;
+use crate::profile::{AllowSshEntry, CustomCredentialDef};
 use nono::{NonoError, Result};
 use nono_proxy::config::{EndpointRule, InjectMode, ProxyConfig, RouteConfig};
 use serde::Deserialize;
@@ -407,30 +407,49 @@ pub fn expand_proxy_allow(policy: &NetworkPolicy, entries: &[String]) -> Vec<Str
 /// Default TCP port for an SSH allowance that omits one.
 pub const DEFAULT_SSH_PORT: u16 = 22;
 
+/// A parsed `allow_ssh` endpoint.
+///
+/// `user` is the remote identity the bastion authenticates as. `None` means
+/// the allowance named none, and the bastion falls back to the username nono
+/// itself runs as, exactly as a bare `ssh host` would.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshEndpoint {
+    pub user: Option<String>,
+    pub host: String,
+    pub port: u16,
+}
+
 /// Parse an `allow_ssh` entry of the form `[user@]host[:port]`.
 ///
-/// The port defaults to [`DEFAULT_SSH_PORT`] and any `user@` prefix is
-/// accepted and discarded, so an SSH target copied from a shell command
-/// parses verbatim. Unlike `allow_domain`, the host must be concrete:
-/// wildcards are rejected, because the whole point of the allowance is that
-/// it names one server.
+/// The port defaults to [`DEFAULT_SSH_PORT`], so an SSH target copied from a
+/// shell command parses verbatim. Unlike `allow_domain`, the host must be
+/// concrete: wildcards are rejected, because the whole point of the allowance
+/// is that it names one server.
 ///
 /// # Errors
 ///
 /// Returns [`NonoError::ConfigParse`] naming the offending entry when the
-/// host is empty or wildcarded, an IPv6 literal is unbracketed, or the port
-/// is not in 1-65535.
-pub fn parse_ssh_endpoint(entry: &str) -> Result<(String, u16)> {
+/// host is empty or wildcarded, an IPv6 literal is unbracketed, the user name
+/// is empty or unusable, or the port is not in 1-65535.
+pub fn parse_ssh_endpoint(entry: &str) -> Result<SshEndpoint> {
     let invalid = |reason: &str| {
         NonoError::ConfigParse(format!("SSH endpoint '{entry}' is invalid: {reason}"))
     };
 
-    let target = entry.rsplit_once('@').map_or(entry, |(_user, host)| host);
+    let (user, target) = match entry.rsplit_once('@') {
+        Some((user, host)) => (Some(user), host),
+        None => (None, entry),
+    };
     if target.contains('*') {
         return Err(invalid(
             "wildcards are not allowed — an SSH allowance must name a single host",
         ));
     }
+
+    let user = match user {
+        None => None,
+        Some(user) => Some(validate_ssh_user(user).map_err(|err| invalid(&err))?),
+    };
 
     let (host, port) = split_ssh_authority(target)
         .ok_or_else(|| invalid("expected [user@]host[:port]; bracket IPv6 literals as [::1]:22"))?;
@@ -442,7 +461,9 @@ pub fn parse_ssh_endpoint(entry: &str) -> Result<(String, u16)> {
         .chars()
         .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '@' | '[' | ']'))
     {
-        return Err(invalid("host contains a character that cannot appear in a hostname"));
+        return Err(invalid(
+            "host contains a character that cannot appear in a hostname",
+        ));
     }
     nono::net_filter::validate_host_pattern(host).map_err(|err| invalid(&err))?;
 
@@ -456,7 +477,29 @@ pub fn parse_ssh_endpoint(entry: &str) -> Result<(String, u16)> {
         },
     };
 
-    Ok((host.to_string(), port))
+    Ok(SshEndpoint {
+        user,
+        host: host.to_string(),
+        port,
+    })
+}
+
+/// Check a remote user name before it becomes an SSH identity.
+///
+/// The name travels in the userauth request, never through a shell, so the
+/// bar is only that it be a name at all: non-empty, one line, no separators
+/// that would make `user@host` ambiguous when the entry is echoed back.
+fn validate_ssh_user(user: &str) -> std::result::Result<String, String> {
+    if user.is_empty() {
+        return Err("user name is empty".to_string());
+    }
+    if user
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | ':'))
+    {
+        return Err("user name contains a character that cannot appear in a user name".to_string());
+    }
+    Ok(user.to_string())
 }
 
 /// Split `host[:port]`, keeping bracketed IPv6 literals intact.
@@ -493,18 +536,55 @@ pub fn ssh_endpoint_authority(host: &str, port: u16) -> String {
     }
 }
 
-/// Parse `allow_ssh` entries into port-exact proxy allowlist authorities.
+/// One `allow_ssh` entry, parsed and with its command restriction attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSshAllowance {
+    pub endpoint: SshEndpoint,
+    /// Empty for an entry that names no commands, which keeps the default
+    /// session policy. Never empty for the object form: an empty list is
+    /// rejected at parse time rather than read as "no restriction".
+    pub commands: Vec<String>,
+}
+
+/// Parse `allow_ssh` entries into endpoints plus their command restrictions.
 ///
 /// # Errors
 ///
-/// Propagates the first [`parse_ssh_endpoint`] failure.
-pub fn ssh_allowlist_entries(entries: &[String]) -> Result<Vec<String>> {
+/// Propagates the first [`parse_ssh_endpoint`] failure, and rejects an object
+/// entry whose `commands` list is empty.
+pub fn resolve_ssh_allowances(entries: &[AllowSshEntry]) -> Result<Vec<ResolvedSshAllowance>> {
     let mut result = Vec::with_capacity(entries.len());
     for entry in entries {
-        let (host, port) = parse_ssh_endpoint(entry)?;
-        result.push(ssh_endpoint_authority(&host, port));
+        let endpoint = parse_ssh_endpoint(entry.endpoint())?;
+        if matches!(entry, AllowSshEntry::WithCommands { .. }) && entry.commands().is_empty() {
+            return Err(NonoError::ConfigParse(format!(
+                "SSH endpoint '{}' names an empty command list: drop the 'commands' key to \
+                 keep the default session policy, or name the commands that may run",
+                entry.endpoint()
+            )));
+        }
+        result.push(ResolvedSshAllowance {
+            endpoint,
+            commands: entry.commands().to_vec(),
+        });
     }
     Ok(result)
+}
+
+/// Parse `allow_ssh` entries into the port-exact authorities the proxy pins.
+///
+/// These deny rather than grant: each named port is closed on every host not
+/// listed. The endpoint itself is reached through the bastion, never through
+/// the proxy, so nothing here puts `host:port` in the allowlist.
+///
+/// # Errors
+///
+/// Propagates the first [`resolve_ssh_allowances`] failure.
+pub fn ssh_pin_authorities(entries: &[AllowSshEntry]) -> Result<Vec<String>> {
+    Ok(resolve_ssh_allowances(entries)?
+        .iter()
+        .map(|allowance| ssh_endpoint_authority(&allowance.endpoint.host, allowance.endpoint.port))
+        .collect())
 }
 
 /// Check if a domain is a loopback address (localhost, 127.x.x.x, ::1).
@@ -623,21 +703,39 @@ mod tests {
         assert!(!policy.profiles.is_empty());
     }
 
+    fn endpoint(user: Option<&str>, host: &str, port: u16) -> SshEndpoint {
+        SshEndpoint {
+            user: user.map(str::to_string),
+            host: host.to_string(),
+            port,
+        }
+    }
+
+    fn plain(entries: &[&str]) -> Vec<AllowSshEntry> {
+        entries
+            .iter()
+            .map(|entry| AllowSshEntry::Plain((*entry).to_string()))
+            .collect()
+    }
+
     #[test]
-    fn parse_ssh_endpoint_accepts_pasted_ssh_targets() {
+    fn parse_ssh_endpoint_keeps_the_user_it_was_given() {
         assert_eq!(
             parse_ssh_endpoint("deploy@build.example.com:2222").unwrap(),
-            ("build.example.com".to_string(), 2222)
+            endpoint(Some("deploy"), "build.example.com", 2222)
         );
         assert_eq!(
             parse_ssh_endpoint("build.example.com").unwrap(),
-            ("build.example.com".to_string(), 22)
+            endpoint(None, "build.example.com", 22)
         );
         assert_eq!(
             parse_ssh_endpoint("[::1]:22").unwrap(),
-            ("::1".to_string(), 22)
+            endpoint(None, "::1", 22)
         );
-        assert_eq!(parse_ssh_endpoint("[::1]").unwrap(), ("::1".to_string(), 22));
+        assert_eq!(
+            parse_ssh_endpoint("[::1]").unwrap(),
+            endpoint(None, "::1", 22)
+        );
     }
 
     #[test]
@@ -662,12 +760,12 @@ mod tests {
     }
 
     #[test]
-    fn ssh_allowlist_entries_are_port_exact_and_bracket_ipv6() {
-        let entries = ssh_allowlist_entries(&[
-            "build.example.com".to_string(),
-            "deploy@other.example.com:2222".to_string(),
-            "[::1]:22".to_string(),
-        ])
+    fn ssh_pin_authorities_are_port_exact_and_bracket_ipv6() {
+        let entries = ssh_pin_authorities(&plain(&[
+            "build.example.com",
+            "deploy@other.example.com:2222",
+            "[::1]:22",
+        ]))
         .unwrap();
         assert_eq!(
             entries,
@@ -678,11 +776,34 @@ mod tests {
     /// The proxy normalizes an incoming authority host before appending the
     /// port, so an entry that keeps an FQDN's trailing dot would be inert.
     #[test]
-    fn ssh_allowlist_entries_normalize_the_host() {
-        let entries =
-            ssh_allowlist_entries(&["Build.Example.com.".to_string(), "h.:2222".to_string()])
-                .unwrap();
+    fn ssh_pin_authorities_normalize_the_host() {
+        let entries = ssh_pin_authorities(&plain(&["Build.Example.com.", "h.:2222"])).unwrap();
         assert_eq!(entries, vec!["build.example.com:22", "h:2222"]);
+    }
+
+    #[test]
+    fn an_object_entry_with_no_commands_is_refused() {
+        let err = resolve_ssh_allowances(&[AllowSshEntry::WithCommands {
+            endpoint: "build.example.com".to_string(),
+            commands: Vec::new(),
+        }])
+        .expect_err("an empty command list must be refused")
+        .to_string();
+        assert!(
+            err.contains("build.example.com") && err.contains("empty command list"),
+            "the refusal must name the entry: {err}"
+        );
+    }
+
+    #[test]
+    fn an_object_entry_carries_its_commands() {
+        let resolved = resolve_ssh_allowances(&[AllowSshEntry::WithCommands {
+            endpoint: "git@build.example.com".to_string(),
+            commands: vec!["git-upload-pack /srv/repo.git".to_string()],
+        }])
+        .expect("a populated command list resolves");
+        assert_eq!(resolved[0].endpoint.user.as_deref(), Some("git"));
+        assert_eq!(resolved[0].commands, vec!["git-upload-pack /srv/repo.git"]);
     }
 
     #[test]

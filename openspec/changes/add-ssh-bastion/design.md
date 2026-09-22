@@ -231,9 +231,41 @@ host` with no command opens a shell and types whatever it likes.
 4. Rollback is `git revert` of the change: the profile key, the pins, and the
    generated-config plumbing all predate it.
 
+## Resolved Questions
+
+- **Certificates and `sk-*` keys through the agent.** `russh::keys::agent`
+  yields an `AgentIdentity` that is either a plain `PublicKey` or a
+  `Certificate`, and the client offers each in turn, so both work over the
+  agent with no extra plumbing. Direct key *files* of either kind do not:
+  `decode_secret_key` refuses a certificate as a parse failure, and a
+  hardware-backed key needs a token nono cannot drive. Both are refused at
+  startup naming `ssh-add` as the remedy, which is what D4 anticipated.
+
+## Measured
+
+- **Latency of one `git fetch` over the mediated route** (task 8.4), against a
+  real `sshd` on loopback with a new commit before each run so every fetch
+  transfers objects: 6 runs, mean **0.56 s** (first run 0.66 s cold, steady
+  state 0.52-0.53 s). The same fetch with no nono at all: 6 runs, mean
+  **0.14 s**. So the route costs about **+0.42 s per fetch**, and that delta is
+  `nono run` startup - sandbox construction, proxy, bastion bind - not the
+  relay: a bare `nono run -- sh -c true` on the same profile lands in the same
+  ballpark. There is no pre-change comparison because the old route no longer
+  exists to measure; an `ssh-tunnel` number would time a different mechanism.
+
+## Known Limits
+
+- **The mediation does not contain an agent the sandbox can already reach.**
+  It stops nono from handing a credential inward; it does not stop a sandboxed
+  process from opening the host's `SSH_AUTH_SOCK` itself. That is decided by
+  `linux.af_unix_mediation`, which is off by default in proxy-only mode
+  (issue #1901). The specs and `docs/cli/features/networking.mdx` say so
+  plainly rather than claim containment the sandbox does not have.
+- **`ssh -L` is refused by the seccomp bind pin, not by the channel policy.**
+  Binding the local listener happens before any channel opens, so the
+  `direct-tcpip` rule never sees it. The rule is still reached - and tested -
+  through `ssh -J`.
+
 ## Open Questions
 
-- Whether `russh`'s client can use certificates presented by an agent without
-  extra plumbing. It does not change the specs or the task breakdown - either it
-  works, or D4's startup refusal covers it - but it decides whether a
-  certificate user is served by the agent path or has to be told no.
+None outstanding.

@@ -8,6 +8,7 @@ use crate::launch_runtime::{
     ProxyLaunchOptions, TlsInterceptIntent, UpstreamProxyIntent,
 };
 use crate::network_policy;
+use crate::profile;
 use crate::sandbox_prepare::{PreparedSandbox, validate_external_proxy_bypass};
 #[cfg(not(target_os = "macos"))]
 use nono::AccessMode;
@@ -37,9 +38,11 @@ pub(crate) struct ActiveProxyRuntime {
     pub(crate) tool_sandbox_credential_env_vars: BTreeMap<String, Vec<(String, String)>>,
     pub(crate) tool_sandbox_trust_bundle_paths: Vec<std::path::PathBuf>,
     pub(crate) handle: Option<nono_proxy::server::ProxyHandle>,
-    /// Generated SSH config and `ssh` wrapper, alive for the session and
-    /// removed on drop. `None` unless `allow_ssh` is in effect.
+    /// Generated SSH config, `ssh` wrapper and session host key, alive for the
+    /// session and removed on drop. `None` unless `allow_ssh` is in effect.
     pub(crate) ssh_client: Option<crate::ssh_client::SshClientFiles>,
+    /// The running SSH mediation. Dropping it removes its socket.
+    pub(crate) ssh_bastion: Option<crate::ssh_bastion::BastionHandle>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -48,7 +51,7 @@ pub(crate) struct EffectiveProxySettings {
     pub(crate) allow_domain: Vec<crate::profile::AllowDomainEntry>,
     pub(crate) deny_domain: Vec<String>,
     pub(crate) credentials: Vec<String>,
-    pub(crate) allow_ssh: Vec<String>,
+    pub(crate) allow_ssh: Vec<profile::AllowSshEntry>,
     pub(crate) no_proxy: Vec<String>,
 }
 
@@ -1619,6 +1622,7 @@ pub(crate) fn prepare_proxy_launch_options(
         enable_h2: prepared.allow_http2_requested,
         no_proxy,
         audit_disabled: false,
+        ssh_key: args.ssh_key.clone(),
     };
 
     // Infra-only flags make no sense without an activating proxy feature.
@@ -1741,7 +1745,11 @@ pub(crate) fn resolve_effective_proxy_settings(
     let mut credentials = prepared.credentials.clone();
     credentials.extend(args.proxy_credential.clone());
     let mut allow_ssh = prepared.allow_ssh.clone();
-    allow_ssh.extend(args.allow_ssh.iter().cloned());
+    allow_ssh.extend(
+        args.allow_ssh
+            .iter()
+            .map(|entry| profile::AllowSshEntry::Plain(entry.clone())),
+    );
 
     let effective = EffectiveProxySettings {
         network_profile,
@@ -2415,7 +2423,7 @@ pub(crate) fn build_proxy_config_from_flags(
     let ssh_hosts = proxy
         .domain_filter
         .as_ref()
-        .map(|d| network_policy::ssh_allowlist_entries(&d.allow_ssh))
+        .map(|d| network_policy::ssh_pin_authorities(&d.allow_ssh))
         .transpose()?
         .unwrap_or_default();
 
@@ -2436,17 +2444,10 @@ pub(crate) fn build_proxy_config_from_flags(
         || !plain_hosts.is_empty()
         || !endpoint_routes.is_empty();
 
-    // Two different jobs. The pins below (`proxy_config.ssh_endpoints`) close
-    // the named port on every other host, which is what makes the allowance
-    // narrowing even on an open policy. The allowlist entry only grants, and
-    // is appended *after* partitioning because `expand_proxy_allow` would
-    // strip the ":port" that makes it name one service rather than a whole
-    // host. It is added only to an allowlist that is already filtering: on an
-    // open policy it would be the entire allowlist and SSH would become the
-    // only reachable destination (#1485).
-    if host_allowlist_active {
-        plain_hosts.extend(ssh_hosts.iter().cloned());
-    }
+    // `ssh_endpoints` below is a pin, not a grant: it closes the named port on
+    // every host the allowance does not name. The endpoint is reached through
+    // the bastion, so nothing puts `host:port` in the allowlist and
+    // `CONNECT host:22` is refused for every host including the allowed one.
 
     // Endpoint-restricted domains need filter allowlist access so the proxy
     // can reach upstream after TLS interception (h2 checks the filter at
@@ -2997,6 +2998,7 @@ pub(crate) fn start_proxy_runtime(
             tool_sandbox_trust_bundle_paths: Vec::new(),
             handle: None,
             ssh_client: None,
+            ssh_bastion: None,
         });
     };
     if !proxy.is_active() {
@@ -3006,6 +3008,7 @@ pub(crate) fn start_proxy_runtime(
             tool_sandbox_trust_bundle_paths: Vec::new(),
             handle: None,
             ssh_client: None,
+            ssh_bastion: None,
         });
     }
 
@@ -3164,14 +3167,17 @@ pub(crate) fn start_proxy_runtime(
     }
     extend_provider_base_url_env_vars(proxy, port, &mut env_vars);
 
-    // `allow_ssh` in effect: give `ssh` and `git` a config that routes through
-    // the CONNECT tunnel. Same lifecycle as the TLS-intercept bundle — a
-    // session-scoped 0o700 dir, granted read, removed on drop.
-    let ssh_client = if proxy
+    // `allow_ssh` in effect: start the mediation and give `ssh` and `git` a
+    // config that routes into it. Same lifecycle as the TLS-intercept bundle:
+    // a session-scoped 0o700 dir, granted read, removed on drop.
+    let allow_ssh: &[profile::AllowSshEntry] = proxy
         .domain_filter
         .as_ref()
-        .is_some_and(|filter| !filter.allow_ssh.is_empty())
-    {
+        .map(|filter| filter.allow_ssh.as_slice())
+        .unwrap_or(&[]);
+    let (ssh_client, ssh_bastion) = if allow_ssh.is_empty() {
+        (None, None)
+    } else {
         let nono_exe = std::env::current_exe().map_err(|e| {
             NonoError::SandboxInit(format!(
                 "network.allow_ssh needs the path to the running nono binary: {e}"
@@ -3179,10 +3185,29 @@ pub(crate) fn start_proxy_runtime(
         })?;
         let files = crate::ssh_client::prepare_ssh_client_files(&nono_exe)?;
         grant_ssh_client_access(caps, &files, &nono_exe)?;
+        warn_on_redundant_agent_grant(caps);
+
+        let bastion = crate::ssh_bastion::start(
+            &rt,
+            crate::ssh_bastion::BastionConfig {
+                socket_path: files.socket_path().to_path_buf(),
+                host_key: files.host_key(),
+                known_hosts: user_known_hosts_path()?,
+                allowances: crate::ssh_bastion::Allowances::new(
+                    network_policy::resolve_ssh_allowances(allow_ssh)?,
+                ),
+                credential: crate::ssh_bastion::credential::resolve(proxy.ssh_key.as_deref())?,
+                default_user: default_remote_user(),
+            },
+        )?;
+
+        grant_bastion_socket_access(caps, bastion.socket_path())?;
+        env_vars.push((
+            crate::ssh_relay::BASTION_SOCKET_ENV.to_string(),
+            bastion.socket_path().display().to_string(),
+        ));
         env_vars.push(("GIT_SSH_COMMAND".to_string(), files.git_ssh_command()));
-        Some(files)
-    } else {
-        None
+        (Some(files), Some(bastion))
     };
 
     std::mem::forget(rt);
@@ -3193,23 +3218,86 @@ pub(crate) fn start_proxy_runtime(
         tool_sandbox_trust_bundle_paths,
         handle: Some(handle),
         ssh_client,
+        ssh_bastion,
     })
 }
 
+/// The user's own `known_hosts`, which the outbound leg verifies against.
+fn user_known_hosts_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        NonoError::SshBastion(
+            "network.allow_ssh needs a home directory to find ~/.ssh/known_hosts".to_string(),
+        )
+    })?;
+    Ok(home.join(".ssh").join("known_hosts"))
+}
+
+/// Remote user for an allowance that names none, matching what a bare
+/// `ssh host` would send.
+fn default_remote_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "root".to_string())
+}
+
+/// Warn when the caller still grants the agent socket into the sandbox.
+///
+/// It was required before the mediation and is now exactly the hole the
+/// mediation closes: an in-sandbox process holding the agent can obtain a
+/// signature for any host, allowed or not.
+fn warn_on_redundant_agent_grant(caps: &CapabilitySet) {
+    let Some(socket) = std::env::var_os(crate::ssh_bastion::AGENT_SOCK_ENV) else {
+        return;
+    };
+    let socket = PathBuf::from(socket);
+    let granted = caps
+        .unix_socket_capabilities()
+        .iter()
+        .any(|cap| cap.original == socket || cap.resolved == socket);
+    if granted {
+        warn!(
+            "--allow-unix-socket {} is no longer needed with network.allow_ssh: nono \
+             authenticates outside the sandbox. Granting the agent socket lets a sandboxed \
+             process obtain a signature for any host, which is what the mediation prevents.",
+            socket.display()
+        );
+    }
+}
+
+/// Grant the sandboxed child connect access to the mediation socket.
+///
+/// `ConnectBind` rather than `Connect`: the capability is built before the
+/// listener binds, and a `Connect` grant requires the path to exist already.
+fn grant_bastion_socket_access(caps: &mut CapabilitySet, socket: &Path) -> Result<()> {
+    let cap = nono::UnixSocketCapability::new_file(socket, nono::UnixSocketMode::ConnectBind)
+        .map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Failed to grant the SSH mediation socket '{}': {e}",
+                socket.display()
+            ))
+        })?;
+    caps.add_unix_socket(cap);
+    Ok(())
+}
+
 /// Grant the sandboxed child read (and, on Linux, execute) access to the
-/// generated SSH config and wrapper. Mirrors the TLS-intercept bundle grant:
-/// both live under the protected `~/.nono` root, which on macOS needs
-/// action-matching platform rules to override the `file-read-data` deny.
+/// generated SSH config, known_hosts and wrapper. Mirrors the TLS-intercept
+/// bundle grant: both live under the protected `~/.nono` root, which on macOS
+/// needs action-matching platform rules to override the `file-read-data` deny.
 ///
 /// `nono_exe` is granted for the same reason: the generated config's
 /// `ProxyCommand` runs that binary, and it is only reachable by accident when
 /// it happens to sit in an already-granted prefix such as the Nix store.
+///
+/// known_hosts is not optional: the config sets `StrictHostKeyChecking yes`
+/// against it, so an ungranted file fails every session with "host key
+/// verification failed" after the outbound leg has already succeeded.
 fn grant_ssh_client_access(
     caps: &mut CapabilitySet,
     files: &crate::ssh_client::SshClientFiles,
     nono_exe: &std::path::Path,
 ) -> Result<()> {
-    let mut paths = vec![files.config_path(), nono_exe];
+    let mut paths = vec![files.config_path(), files.known_hosts_path(), nono_exe];
     paths.extend(files.wrapper_path());
     for path in paths {
         #[cfg(target_os = "macos")]
@@ -3217,7 +3305,9 @@ fn grant_ssh_client_access(
             let path_str = crate::policy::path_to_utf8(path)?;
             let escaped = crate::policy::escape_seatbelt_path(path_str)?;
             caps.add_platform_rule(format!("(allow file-read-data (literal \"{escaped}\"))"))?;
-            caps.add_platform_rule(format!("(allow file-read-metadata (literal \"{escaped}\"))"))?;
+            caps.add_platform_rule(format!(
+                "(allow file-read-metadata (literal \"{escaped}\"))"
+            ))?;
             caps.add_platform_rule(format!("(allow process-exec (literal \"{escaped}\"))"))?;
         }
         #[cfg(not(target_os = "macos"))]
@@ -3676,32 +3766,38 @@ mod tests {
                     .map(|d| crate::profile::AllowDomainEntry::Plain((*d).to_string()))
                     .collect(),
                 deny_domain: Vec::new(),
-                allow_ssh: allow_ssh.iter().map(|s| (*s).to_string()).collect(),
+                allow_ssh: allow_ssh
+                    .iter()
+                    .map(|s| profile::AllowSshEntry::Plain((*s).to_string()))
+                    .collect(),
             }),
             ..ProxyLaunchOptions::default()
         }
     }
 
+    /// The allowance grants a mediated session, not reachability. Putting the
+    /// endpoint in the allowlist would hand the sandbox a raw CONNECT to the
+    /// SSH port, which is the capability the bastion exists to remove.
     #[test]
-    fn test_allow_ssh_is_port_exact_in_the_allowlist() -> Result<()> {
+    fn test_allow_ssh_never_reaches_the_proxy_allowlist() -> Result<()> {
         let proxy = filtered_proxy(&["api.example.com"], &["deploy@build.example.com"]);
         let config = build_proxy_config_from_flags(&proxy)?;
 
         assert!(
-            config
-                .allowed_hosts
-                .iter()
-                .any(|host| host == "build.example.com:22"),
-            "allow_ssh must reach the allowlist as host:port, got {:?}",
-            config.allowed_hosts
-        );
-        assert!(
             !config
                 .allowed_hosts
                 .iter()
-                .any(|host| host == "build.example.com"),
-            "a bare-host fallback would defeat port-exactness, got {:?}",
+                .any(|host| host.starts_with("build.example.com")),
+            "allow_ssh must not grant reachability, got {:?}",
             config.allowed_hosts
+        );
+        assert!(
+            config
+                .ssh_endpoints
+                .iter()
+                .any(|entry| entry == "build.example.com:22"),
+            "the port pin must still be installed, got {:?}",
+            config.ssh_endpoints
         );
         Ok(())
     }
@@ -3721,12 +3817,14 @@ mod tests {
     }
 
     /// The contract that distinguishes `allow_ssh` from `allow_domain`: the
-    /// allowed port is reachable and every other port on the same host is not.
+    /// named port is closed on every host, the allowed endpoint included,
+    /// because the only route to it is the mediation.
     #[test]
-    fn test_allow_ssh_allowlist_refuses_other_ports_and_hosts() -> Result<()> {
+    fn test_allow_ssh_pin_closes_its_port_everywhere() -> Result<()> {
         let proxy = filtered_proxy(&["api.example.com"], &["localhost:2222"]);
         let config = build_proxy_config_from_flags(&proxy)?;
-        let filter = nono_proxy::filter::ProxyFilter::new(&config.allowed_hosts);
+        let filter = nono_proxy::filter::ProxyFilter::new(&config.allowed_hosts)
+            .with_ssh_endpoints(&config.ssh_endpoints);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3740,16 +3838,16 @@ mod tests {
         };
 
         assert!(
-            allowed("localhost", 2222),
-            "the allowed endpoint must pass the filter"
-        );
-        assert!(
-            !allowed("localhost", 22),
-            "another port on the allowed host must be refused"
+            !allowed("localhost", 2222),
+            "the allowed endpoint must not be reachable as raw TCP"
         );
         assert!(
             !allowed("example.com", 2222),
-            "another host on the allowed port must be refused"
+            "another host on the pinned port must be refused"
+        );
+        assert!(
+            allowed("api.example.com", 443),
+            "an unrelated allowed domain must stay reachable"
         );
         Ok(())
     }

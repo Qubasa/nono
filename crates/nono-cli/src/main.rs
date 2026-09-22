@@ -72,8 +72,9 @@ mod sandbox_state;
 mod session;
 mod session_commands;
 mod setup;
+mod ssh_bastion;
 mod ssh_client;
-mod ssh_tunnel;
+mod ssh_relay;
 mod startup_prompt;
 mod startup_runtime;
 mod state_paths;
@@ -292,7 +293,9 @@ mod tests {
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
             )],
-            allow_ssh: vec!["build.example.com".to_string()],
+            allow_ssh: vec![profile::AllowSshEntry::Plain(
+                "build.example.com".to_string(),
+            )],
             deny_domain: Vec::new(),
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
@@ -371,7 +374,9 @@ mod tests {
             allow_domain: vec![profile::AllowDomainEntry::Plain(
                 "docs.python.org".to_string(),
             )],
-            allow_ssh: vec!["build.example.com".to_string()],
+            allow_ssh: vec![profile::AllowSshEntry::Plain(
+                "build.example.com".to_string(),
+            )],
             deny_domain: Vec::new(),
             credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
@@ -420,8 +425,8 @@ mod tests {
                     profile::AllowDomainEntry::Plain("example.com".to_string()),
                 ],
                 allow_ssh: vec![
-                    "build.example.com".to_string(),
-                    "deploy@other.example.com:2222".to_string(),
+                    profile::AllowSshEntry::Plain("build.example.com".to_string()),
+                    profile::AllowSshEntry::Plain("deploy@other.example.com:2222".to_string()),
                 ],
                 deny_domain: Vec::new(),
                 credentials: vec!["github".to_string(), "openai".to_string()],

@@ -143,7 +143,7 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::Outdated(_)
         | Commands::OpenUrlHelper(_)
         | Commands::PackUpdateHintHelper(_)
-        | Commands::SshTunnel(_)
+        | Commands::SshRelay(_)
         | Commands::Completions(_) => 0,
     }
 }
