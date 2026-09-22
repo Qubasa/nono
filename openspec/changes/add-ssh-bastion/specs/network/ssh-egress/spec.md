@@ -1,5 +1,67 @@
 ## MODIFIED Requirements
 
+### Requirement: An SSH allowance names one endpoint and is port-exact
+
+An SSH allowance MUST be expressed as `[user@]host[:port]`, where the port
+defaults to 22 and any `user@` prefix is accepted and ignored, so an SSH target
+copied from a shell command can be pasted verbatim. The allowance MUST permit
+that host on that port only.
+
+An allowance MAY instead be written as an object naming the same endpoint plus
+the exact commands that endpoint may run. Both forms MUST be accepted in the
+same list, and the endpoint MUST be interpreted identically in either form.
+
+Unlike a domain allowance, an SSH allowance MUST NOT widen to other ports on
+the same host, and MUST NOT emit the "port is ignored" warning that domain
+allowances emit, because the port is not ignored.
+
+#### Scenario: Default port
+
+- **WHEN** a profile allows SSH to `build.example.com`
+- **THEN** a session to `build.example.com` port 22 is established, and a
+  session to `build.example.com` port 443 is refused
+
+#### Scenario: Explicit non-default port
+
+- **WHEN** a profile allows SSH to `build.example.com:2222`
+- **THEN** a session to port 2222 is established, and a session to port 22 on
+  the same host is refused
+
+#### Scenario: SSH target pasted with a user prefix
+
+- **WHEN** a profile allows SSH to `deploy@build.example.com:2222`
+- **THEN** the allowance is equivalent to `build.example.com:2222`, and the
+  user name has no effect on which endpoints are reachable
+
+#### Scenario: A second host is not reachable
+
+- **WHEN** a profile allows SSH to `build.example.com` only
+- **THEN** a session to any other host on port 22 is refused with a message
+  naming the host and stating it is not in the allowlist
+
+#### Scenario: No port-ignored warning
+
+- **WHEN** a profile allows SSH to `build.example.com:2222`
+- **THEN** no warning claiming that the port suffix is ignored is printed
+
+#### Scenario: Object form with commands
+
+- **WHEN** a profile allows SSH with an object naming `build.example.com` and a
+  list of commands
+- **THEN** the endpoint is reachable exactly as the string form would make it,
+  and only the named commands may run
+
+#### Scenario: Both forms in one list
+
+- **WHEN** a profile's SSH allowances mix string entries and object entries
+- **THEN** the profile loads and each entry keeps its own behavior
+
+#### Scenario: Object form with an empty command list
+
+- **WHEN** an object entry names an endpoint and an empty command list
+- **THEN** loading fails with an error naming the entry, because an empty list
+  would otherwise read as either "no restriction" or "nothing may run"
+
 ### Requirement: SSH reachability is enforced below the client
 
 An SSH allowance MUST be enforced such that a process in the sandbox cannot

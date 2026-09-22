@@ -15,16 +15,49 @@
 ## 2. Channel policy
 
 - [ ] 2.1 Add `ssh_bastion::policy` with `ChannelDecision::{Allow,
-      Refuse(RefusedRequest)}` and one function mapping (channel type, request)
-      to a decision, with no wildcard match arm; verify with unit tests that
-      `session`+`exec`, `shell`, `pty-req`, `window-change`, `subsystem` and
-      `signal` are allowed
+      Refuse(RefusedRequest)}` and one function mapping (endpoint rule, channel
+      type, request) to a decision, with no wildcard match arm; verify with unit
+      tests that on an unrestricted endpoint `session`+`exec`, `shell`,
+      `pty-req`, `window-change`, `subsystem` and `signal` are allowed
 - [ ] 2.2 Refuse `direct-tcpip`, `forwarded-tcpip`, `tcpip-forward`,
       `cancel-tcpip-forward`, `auth-agent-req@openssh.com` and `x11-req`, each
       with a reason naming the request; verify one unit test per refusal
       asserting the reason text names the request type
 - [ ] 2.3 Verify by test that adding a new channel-request variant does not
       compile until it is classified (no `_ =>` arm anywhere in the module)
+- [ ] 2.4 On an endpoint carrying a command list, refuse `shell`, `pty-req` and
+      `subsystem`; verify by unit test that each is refused with a reason
+      naming the command restriction, and that the same requests are allowed on
+      an endpoint without a list
+
+## 2b. Command allowlist
+
+- [ ] 2b.1 Turn `allow_ssh` into an untagged `AllowSshEntry::{Plain(String),
+      WithCommands { endpoint, commands }}` mirroring `AllowDomainEntry`
+      (`crates/nono-cli/src/profile/mod.rs:1768`); verify a profile mixing both
+      forms parses and that every existing string-only profile still parses
+- [ ] 2b.2 Reject an object entry with an empty `commands` list at load time,
+      next to the existing endpoint validation; verify the error names the entry
+      and that no sandbox starts
+- [ ] 2b.3 Add the object form to `crates/nono-cli/data/nono-profile.schema.json`
+      and to the pinned shape in `tests/schema_shape.rs`; verify the schema test
+      passes and the schema accepts both forms
+- [ ] 2b.4 Implement `command_matches(rule, requested) -> bool`: refuse any
+      requested command containing `; | & $ backtick ( ) < > { }` or a newline
+      *before* tokenising, then quote-aware POSIX word-split both sides and
+      compare argument vectors element-wise; verify by unit test that
+      `git-upload-pack '/srv/repo.git'` matches `git-upload-pack /srv/repo.git`,
+      that an extra argument does not match, that a different argv0 does not
+      match, and that `allowed; curl evil` is refused before matching
+- [ ] 2b.5 Property-test the metacharacter refusal: for a rule and any request
+      containing a separator, the result is always a refusal; verify with
+      `proptest` over generated command strings
+- [ ] 2b.6 Wire the endpoint's rule into the `exec` path so a refused command
+      starts no remote process; verify against a real `sshd` that a refused
+      command leaves no trace in the remote host's logs while an allowed one runs
+- [ ] 2b.7 Make the refusal distinguishable from a remote failure in both the
+      exit status and the message; verify a refused command reports the nono
+      refusal text and not a remote exit code
 
 ## 3. Sandbox-facing leg
 
@@ -126,6 +159,12 @@
       interactive runs; `git fetch` over SSH succeeds; `scp`/`sftp` succeed;
       `ssh -L` is refused; `ssh -R` is refused; `ssh -J` is refused;
       `ssh -A` is refused; a second host on the pinned port is refused
+- [ ] 8.2b Command allowlist matrix against the same `sshd`, one test each: the
+      named command runs; a different command is refused; the named command with
+      an extra argument is refused; `ssh host` with no command is refused on a
+      restricted endpoint; `git fetch` works against an endpoint whose list
+      names `git-upload-pack <path>`; `git push` is refused when only
+      `git-upload-pack` is listed
 - [ ] 8.3 Verify no agent socket and no private key are reachable inside the
       sandbox during a successful session (assert on the capability set and on
       a read attempt from inside)
@@ -141,6 +180,11 @@
 - [ ] 9.2 Document the credential change: the agent stays outside, the grant is
       no longer needed, `--ssh-key` is read by nono; verify `docs/cli/usage/flags.mdx`
       matches the implemented behavior
+- [ ] 9.2b Document the command allowlist: the object form, exact argv matching,
+      the metacharacter refusal, and that a restricted endpoint loses shell, pty
+      and subsystems; include the `git-upload-pack`/`git-receive-pack` example
+      and state plainly that bounding what an allowed command *does* is the
+      remote host's job
 - [ ] 9.3 Delete `crates/nono-cli/src/ssh_tunnel.rs`, its CLI wiring, and the
       `SshTunnel` error variant if nothing else uses it; verify `cargo check -p
       nono-cli --all-targets` is clean and no doc references the subcommand

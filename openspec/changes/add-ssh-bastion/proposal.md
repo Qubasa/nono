@@ -27,11 +27,31 @@ sandbox, and verify the remote host key itself.
 - **New:** an SSH bastion inside nono. The sandboxed client speaks SSH to nono
   over a session-scoped unix socket; nono authenticates to the real endpoint
   itself and relays the session at the channel level.
-- **New:** a channel policy. `session` channels with `shell`, `exec`, `pty-req`,
-  `window-change` and `subsystem` requests are allowed and audited. Every
-  forwarding request - `direct-tcpip` (`-L`, `-D`, and `-J`), `tcpip-forward`
-  (`-R`), `auth-agent-req@openssh.com`, `x11-req` - is refused, and the refusal
-  names the request type.
+- **New:** a channel policy. By default a `session` channel with `shell`,
+  `exec`, `pty-req`, `window-change` and `subsystem` requests is allowed and
+  audited. Every forwarding request - `direct-tcpip` (`-L`, `-D`, and `-J`),
+  `tcpip-forward` (`-R`), `auth-agent-req@openssh.com`, `x11-req` - is refused,
+  and the refusal names the request type.
+- **New:** a per-endpoint command allowlist. An allowance may carry a list of
+  exact command lines, and then only those commands run:
+
+  ```json
+  "allow_ssh": [
+    { "endpoint": "git@build.example.com",
+      "commands": ["git-upload-pack /srv/repo.git"] }
+  ]
+  ```
+
+  The entry is an object form of the existing string entry, mirroring how
+  `allow_domain` already carries optional endpoint rules
+  (`AllowDomainEntry::{Plain, WithEndpoints}`, `crates/nono-cli/src/profile/mod.rs:1768`).
+  Matching is exact on the tokenised argument vector; a command carrying shell
+  metacharacters is refused before matching, because the string is interpreted
+  by the remote shell and not by nono.
+- **New:** an endpoint that carries a command allowlist becomes a task
+  endpoint, not a login. `shell`, `pty-req` and `subsystem` are refused there,
+  because an interactive shell would simply run the command the allowlist just
+  refused. Endpoints without a list keep the default above.
 - **New:** credentials leave the sandbox. nono uses the *host's* agent or a key
   file it reads itself; neither the agent socket nor the key file needs a grant
   inside the sandbox any more.
@@ -48,29 +68,31 @@ sandbox, and verify the remote host key itself.
   unknown-subcommand error.
 - **Unchanged:** the port pin (`ssh_endpoints`), the kernel-enforcement refusal
   (`allow_ssh` without the seccomp supervisor fails at startup), the
-  `--block-net` and `no_proxy` conflicts, the generated wrapper and
-  `GIT_SSH_COMMAND` ergonomics, and the `[user@]host[:port]` entry syntax.
+  `--block-net` and `no_proxy` conflicts, and the generated wrapper and
+  `GIT_SSH_COMMAND` ergonomics. The `[user@]host[:port]` endpoint syntax is
+  unchanged; it gains an object form that carries the command list.
 
-Explicitly out of scope: per-command authorization (an allowlist of `exec`
-command lines), session recording/replay, and multi-user access. The channel
-policy is a fixed default in this change; the hooks it needs to become
-configurable are noted in the design.
+Explicitly out of scope: session recording or replay beyond the audit line, and
+multi-user access. Command allowlists are per endpoint and exact; patterns,
+globs and argument templating are deliberately absent.
 
 ## Capabilities
 
 ### New Capabilities
 
 - `network/ssh-session-mediation`: nono terminates the SSH session, authorizes
-  it at the channel level, holds the credential outside the sandbox, and
-  verifies the remote host key on the sandbox's behalf.
+  it at the channel level and - where an allowance says so - at the command
+  level, holds the credential outside the sandbox, and verifies the remote host
+  key on the sandbox's behalf.
 
 ### Modified Capabilities
 
 - `network/ssh-egress`: an SSH allowance now authorizes a *mediated SSH
-  session* rather than a raw TCP tunnel to the endpoint. Reachability, port
-  exactness, load-time validation and the kernel-enforcement refusal are
-  unchanged; the route and the failure text change, and the tunnel subcommand
-  is removed.
+  session* rather than a raw TCP tunnel to the endpoint, and may name the exact
+  commands that session may run. Reachability, port exactness and the
+  kernel-enforcement refusal are unchanged; the entry syntax gains an object
+  form, the route and the failure text change, and the tunnel subcommand is
+  removed.
 
 ## Dependencies
 

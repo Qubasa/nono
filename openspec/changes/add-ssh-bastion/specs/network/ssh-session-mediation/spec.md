@@ -49,7 +49,8 @@ Mediation MUST authorize each channel and each channel request individually. A
 `session` channel MUST be permitted, and within it the requests that run work on
 the remote host - starting a shell, executing a command, requesting a
 pseudo-terminal, reporting a terminal resize, and starting a named subsystem -
-MUST be permitted.
+MUST be permitted, unless the allowance for that endpoint restricts the commands
+it may run, in which case the narrower rules of that requirement apply.
 
 Every request that turns the session into a transport MUST be refused: opening a
 forwarded connection to a third address, asking the remote host to listen on a
@@ -97,6 +98,84 @@ passed through.
 
 - **WHEN** a client sends a channel request nono does not recognise
 - **THEN** the request is refused rather than forwarded to the remote host
+
+### Requirement: An allowance may restrict which remote commands run
+
+An SSH allowance MAY name the exact commands its endpoint may run. When it
+does, mediation MUST refuse every command the allowance does not name, and MUST
+refuse every request that would let the session run work outside that list:
+starting a shell, allocating a pseudo-terminal, and starting a subsystem. An
+endpoint restricted this way is a task endpoint, not a login.
+
+Matching MUST be exact on the command's argument vector after quote-aware
+tokenisation, so that a rule naming one command cannot be satisfied by a
+different command, by the same command with different arguments, or by
+additional arguments.
+
+Because the command string is interpreted by the remote host and not by nono, a
+requested command that contains shell metacharacters - command separators,
+pipes, redirections, command substitution, background operators, or newlines -
+MUST be refused before matching is attempted, whether or not the allowance
+would otherwise permit it.
+
+A refusal MUST name the command that was refused and MUST be distinguishable
+from the command failing on the remote host.
+
+An allowance that names no commands MUST keep the default session behavior, so
+adding the restriction is an opt-in narrowing and its absence never widens
+anything.
+
+#### Scenario: Allowed command
+
+- **WHEN** an allowance names a command and a sandboxed process runs exactly
+  that command against that endpoint
+- **THEN** the command runs on the remote host and its output and exit status
+  are returned
+
+#### Scenario: Different command
+
+- **WHEN** a sandboxed process runs a command the allowance does not name
+- **THEN** the request is refused with the command named, no process is started
+  on the remote host, and the refusal is not reported as a remote failure
+
+#### Scenario: Same command, different arguments
+
+- **WHEN** an allowance names a command with one argument and a sandboxed
+  process runs the same command with a different or additional argument
+- **THEN** the request is refused, because matching is exact on the whole
+  argument vector
+
+#### Scenario: Shell metacharacters
+
+- **WHEN** a sandboxed process requests an allowed command with a command
+  separator and a second command appended
+- **THEN** the request is refused before matching, and neither command runs
+
+#### Scenario: Interactive shell on a restricted endpoint
+
+- **WHEN** a sandboxed process starts an interactive session against an endpoint
+  whose allowance names commands
+- **THEN** the session is refused, because a shell would run commands the
+  allowance does not name
+
+#### Scenario: Subsystem on a restricted endpoint
+
+- **WHEN** a sandboxed process starts a file-transfer subsystem against an
+  endpoint whose allowance names commands
+- **THEN** the request is refused, because a file-transfer subsystem reads and
+  writes outside the named commands
+
+#### Scenario: Unrestricted endpoint is unaffected
+
+- **WHEN** an allowance names no commands
+- **THEN** commands, shells, pseudo-terminals and subsystems behave as the
+  default session policy allows
+
+#### Scenario: Restriction is recorded
+
+- **WHEN** a command is refused by an allowance's command list
+- **THEN** the audit trail records the endpoint, the requested command, and that
+  the command list refused it
 
 ### Requirement: The authenticating credential stays outside the sandbox
 

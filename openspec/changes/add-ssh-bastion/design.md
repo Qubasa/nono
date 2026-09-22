@@ -29,8 +29,12 @@ bytes to it.
 
 **Non-Goals**
 
-- Configurability of the channel policy. The allowed set is fixed here; the
-  policy lives behind one function so a later change can take a profile key.
+- Pattern matching of any kind in the command allowlist. Rules are exact argument
+  vectors; globs, prefixes and argument templating are the footgun this design
+  refuses, because each of them turns "allow one command" into "allow a family
+  of commands I have not enumerated".
+- Configurability of the *channel* policy beyond the command allowlist. Which
+  forwarding requests are refused is fixed here.
 - Session recording beyond the audit line. No keystroke or output capture.
 - Performance work. Two SSH sessions mean two handshakes and double symmetric
   crypto; on a `git fetch` this is noise next to the transfer.
@@ -135,6 +139,54 @@ The filter's port pins stay as they are. They are now defence in depth rather
 than the route: with `allow_ssh` no longer adding `host:port` to
 `allowed_hosts`, `CONNECT host:22` is refused for every host, allowed or not.
 
+### D7: Exact argv matching, on an object form of the allowance entry
+
+`allow_ssh` becomes an untagged enum mirroring `AllowDomainEntry`
+(`crates/nono-cli/src/profile/mod.rs:1768`), so the two allowlists stay the
+same shape and `serde` handles the string/object split:
+
+```rust
+enum AllowSshEntry {
+    Plain(String),
+    WithCommands { endpoint: String, commands: Vec<String> },
+}
+```
+
+Matching runs in three steps, all in the parent:
+
+1. **Reject, then tokenise.** If the requested command contains any of
+   `; | & $ \` ( ) < > { }` or a newline, refuse immediately. These are the
+   characters that let one command become two, and nono cannot evaluate them -
+   the remote shell does.
+2. **Tokenise both sides identically.** Quote-aware POSIX word splitting with
+   no expansion, applied to the rule and to the request. `git-upload-pack
+   '/srv/repo.git'` and `git-upload-pack /srv/repo.git` are the same argv, and
+   should match the same rule.
+3. **Compare argument vectors element-wise.** No prefix, no glob, no "argv0
+   matches so the rest is free".
+
+Step 1 before step 2 matters: tokenising first and inspecting tokens afterwards
+invites a rule that looks satisfied while the string still carries a separator
+the shell will act on.
+
+A restricted endpoint refuses `shell`, `pty-req` and `subsystem` outright -
+D3's decision function takes the endpoint's rule as an input rather than
+deciding on the request alone. Without that, the allowlist is theatre: `ssh
+host` with no command opens a shell and types whatever it likes.
+
+- **Alternative rejected: argv0 allowlisting.** One rule would cover every
+  repository, which is the appeal and also the hole - `git-upload-pack` with a
+  free path argument reaches every repository on the host, and
+  `git-receive-pack` is a *different* argv0 that a user who wrote "allow git"
+  would assume was covered.
+- **Alternative rejected: forced commands** (OpenSSH's `command=`). Robust,
+  since nothing is matched at all, but an endpoint can then run exactly one
+  thing, and `git fetch` plus `git push` already needs two.
+- **Not nono's to enforce:** what the allowed command then does on the far
+  side. `git-upload-pack /srv/repo.git` is trusted to be `git-upload-pack`.
+  A remote-side `authorized_keys` with `restrict` remains the stronger control
+  and the two compose.
+
 ## Risks / Trade-offs
 
 - **`russh` parses hostile remote bytes inside the parent process** → This is
@@ -144,6 +196,15 @@ than the route: with `allow_ssh` no longer adding `host:port` to
   the parent already parses attacker-influenced input (TLS, HTTP/2) from the
   same position. A panic in a session task must not take the proxy down -
   sessions run as supervised tasks whose failure ends that session only.
+- **A command allowlist reads as stronger than it is** → It authorizes the
+  *request*, not the effect. `git-receive-pack /srv/repo.git` is a push, and a
+  push can run remote hooks. Document that the allowlist bounds which commands
+  start, and that bounding what they then do is the remote host's job
+  (`authorized_keys` `restrict`, `command=`).
+- **Exact matching breaks on a client that quotes differently** → Tokenise
+  before comparing rather than comparing strings, and test the real clients:
+  OpenSSH's `git` integration quotes the repository path, plain `ssh host cmd`
+  does not, and both must match the same rule.
 - **Feature regressions surface as "ssh broke"** → The refusal path names the
   request type and points at the documentation, so `-L` fails as "port
   forwarding is refused by network.allow_ssh", not as a hang. The acceptance
