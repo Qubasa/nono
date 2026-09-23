@@ -3176,6 +3176,11 @@ fn build_outer_exec_files<'a>(
         }
     }
 
+    // A script's interpreter, `env` target or `exec` wrapper target can itself
+    // be a gated binary. A gated inode stays reachable only through its shim.
+    paths.retain(|path| {
+        fs::metadata(path).is_ok_and(|metadata| !controlled_ids.contains(&file_id(&metadata)))
+    });
     Ok(paths)
 }
 

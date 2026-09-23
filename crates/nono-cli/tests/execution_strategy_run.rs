@@ -351,6 +351,38 @@ fn command_policies_allows_immutable_store_shebang_wrapper() {
         .assert_stdout_contains("wrapped ok");
 }
 
+/// The gate follows an admitted wrapper's `exec` target, but that must not
+/// hand execute back to a gated binary, which is only reachable through its shim.
+#[test]
+#[cfg(target_os = "linux")]
+fn command_policies_wrapper_cannot_exec_a_gated_binary() {
+    let t = nono_test!("cmd-policies-wrapper-gated");
+    let (store_dir, interpreter, profile) = store_fixture(&t, "cmd-policies-wrapper-gated");
+
+    let sed = host_executable("sed").expect("sed is on every supported host");
+    let wrapper = store_dir.join("sed-wrapper");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!{}\nexec {} --version\n",
+            interpreter.display(),
+            sed.display()
+        ),
+    )
+    .expect("write wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o500)).expect("seal wrapper");
+
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new(wrapper.as_os_str()))
+        .assert_exit_code(
+            126,
+            "the gated sed stays denied when a wrapper execs it by path",
+        )
+        .assert_stdout_lacks("sed");
+}
+
 /// Same as above but for a binary compiled at runtime, so it wasn't on disk
 /// when the outer exec gate was set up.
 #[test]
