@@ -163,7 +163,7 @@ pkgs.testers.runNixOSTest {
         return "timeout 120 " + agent_sh(cmd) + " </dev/null"
 
     with subtest("ssh reaches the endpoint and reads no hostile config"):
-        out = client.succeed(mediated("ssh server 'echo SSH-OK; id -un'") + " 2>&1")
+        out = client.succeed(mediated("ssh deploy@server 'echo SSH-OK; id -un'") + " 2>&1")
         assert "SSH-OK" in out, out
         assert "deploy" in out, out
         assert "Bad owner or permissions" not in out, out
@@ -172,7 +172,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("scp pulls a file"):
         out = client.succeed(
-            mediated(f"scp server:/tmp/payload {work}/got && cat {work}/got") + " 2>&1"
+            mediated(f"scp deploy@server:/tmp/payload {work}/got && cat {work}/got") + " 2>&1"
         )
         assert "${payload}" in out, out
         assert "Bad owner or permissions" not in out, out
@@ -180,7 +180,7 @@ pkgs.testers.runNixOSTest {
     with subtest("sftp pulls a file"):
         out = client.succeed(
             mediated(
-                f"echo 'get /tmp/payload {work}/sftp-got' | sftp -b - server "
+                f"echo 'get /tmp/payload {work}/sftp-got' | sftp -b - deploy@server "
                 f"&& cat {work}/sftp-got"
             )
             + " 2>&1"
@@ -190,14 +190,18 @@ pkgs.testers.runNixOSTest {
 
     with subtest("rsync pulls a file"):
         out = client.succeed(
-            mediated(f"rsync server:/tmp/payload {work}/rsync-got && cat {work}/rsync-got")
+            mediated(
+                f"rsync deploy@server:/tmp/payload {work}/rsync-got && cat {work}/rsync-got"
+            )
             + " 2>&1"
         )
         assert "${payload}" in out, out
 
     with subtest("rsync pushes a file"):
         client.succeed(
-            mediated(f"echo pushed-by-rsync > {work}/up && rsync {work}/up server:/tmp/pushed")
+            mediated(
+                f"echo pushed-by-rsync > {work}/up && rsync {work}/up deploy@server:/tmp/pushed"
+            )
             + " 2>&1"
         )
         server.succeed("grep -q pushed-by-rsync /tmp/pushed")
@@ -209,7 +213,8 @@ pkgs.testers.runNixOSTest {
             "git init -q --bare'"
         )
         out = client.succeed(
-            mediated("git ls-remote server:/tmp/repo >/dev/null && echo GIT-OK") + " 2>&1"
+            mediated("git ls-remote deploy@server:/tmp/repo >/dev/null && echo GIT-OK")
+            + " 2>&1"
         )
         assert "GIT-OK" in out, out
 
@@ -220,7 +225,7 @@ pkgs.testers.runNixOSTest {
         # refused before any channel reaches the bastion.
         out = client.fail(
             mediated(
-                "ssh -o ExitOnForwardFailure=yes -L 12345:server:22 server true"
+                "ssh -o ExitOnForwardFailure=yes -L 12345:server:22 deploy@server true"
             )
             + " 2>&1"
         )
@@ -230,7 +235,7 @@ pkgs.testers.runNixOSTest {
         # `-W` is the `direct-tcpip` request on its own, in one process. `-J`
         # would reach the same rule but nests a second `ssh` whose stderr
         # OpenSSH discards, leaving nothing to assert on.
-        out = client.fail(mediated("ssh -W server:22 server") + " 2>&1")
+        out = client.fail(mediated("ssh -W server:22 deploy@server") + " 2>&1")
         assert "direct-tcpip" in out, out
 
     with subtest("the endpoint is not reachable as raw TCP"):
@@ -242,5 +247,13 @@ pkgs.testers.runNixOSTest {
     with subtest("an unallowed host is refused by name"):
         out = client.fail(mediated("ssh other.invalid true") + " 2>&1")
         assert "not an allowed SSH endpoint" in out, out
+
+    with subtest("a remote user the allowance does not name is refused"):
+        # `agent` is the local user, which a bare `ssh server` would send.
+        for target in ["root@server", "server"]:
+            out = client.fail(mediated(f"ssh {target} 'echo SSH-OK'") + " 2>&1")
+            assert "SSH-OK" not in out, out
+            assert "is not an allowed remote user" in out, out
+            assert "deploy@server:22" in out, out
   '';
 }

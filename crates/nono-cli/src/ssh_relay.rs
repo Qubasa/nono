@@ -1,10 +1,11 @@
-//! `nono ssh-relay <host> <port>` — the in-sandbox half of the SSH mediation.
+//! `nono ssh-relay <host> <port> <user>` — the in-sandbox half of the SSH
+//! mediation.
 //!
 //! OpenSSH runs it as a `ProxyCommand`, so it runs *inside* the sandbox. That
 //! is exactly why it holds no policy and no credential: it connects to the
-//! bastion's unix socket, names the endpoint the client asked for, and copies
-//! bytes. Compromising it grants nothing the sandbox does not already have,
-//! because the endpoint it names is re-checked in the parent.
+//! bastion's unix socket, names the endpoint and remote user the client asked
+//! for, and copies bytes. Compromising it grants nothing the sandbox does not
+//! already have, because the request it names is re-checked in the parent.
 
 use crate::cli::SshRelayArgs;
 use crate::ssh_bastion::{ACCEPTED_REPLY, DENIED_REPLY, TARGET_PREAMBLE};
@@ -33,10 +34,10 @@ pub(crate) fn run_ssh_relay(args: SshRelayArgs) -> Result<()> {
             NonoError::SshBastion(format!("nono ssh-relay: could not start runtime: {err}"))
         })?;
 
-    runtime.block_on(relay(&socket, &args.host, args.port))
+    runtime.block_on(relay(&socket, &args))
 }
 
-async fn relay(socket: &str, host: &str, port: u16) -> Result<()> {
+async fn relay(socket: &str, target: &SshRelayArgs) -> Result<()> {
     let mut stream = UnixStream::connect(socket).await.map_err(|err| {
         NonoError::SshBastion(format!(
             "nono ssh-relay: could not reach the SSH mediation at {socket}: {err}"
@@ -44,7 +45,13 @@ async fn relay(socket: &str, host: &str, port: u16) -> Result<()> {
     })?;
 
     stream
-        .write_all(format!("{TARGET_PREAMBLE} {host} {port}\n").as_bytes())
+        .write_all(
+            format!(
+                "{TARGET_PREAMBLE} {} {} {}\n",
+                target.host, target.port, target.user
+            )
+            .as_bytes(),
+        )
         .await
         .map_err(NonoError::Io)?;
     stream.flush().await.map_err(NonoError::Io)?;

@@ -409,9 +409,10 @@ pub const DEFAULT_SSH_PORT: u16 = 22;
 
 /// A parsed `allow_ssh` endpoint.
 ///
-/// `user` is the remote identity the bastion authenticates as. `None` means
-/// the allowance named none, and the bastion falls back to the username nono
-/// itself runs as, exactly as a bare `ssh host` would.
+/// `user` is the remote identity the allowance permits, and the one the
+/// bastion authenticates as. `None` means the allowance named none, and it
+/// stands for the username nono itself runs as, exactly as a bare `ssh host`
+/// would.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshEndpoint {
     pub user: Option<String>,
@@ -551,10 +552,11 @@ pub struct ResolvedSshAllowance {
 ///
 /// Propagates the first [`parse_ssh_endpoint`] failure, rejects an object
 /// entry whose `commands` list is empty or carries a command that does not
-/// tokenise, and rejects a repeated authority.
+/// tokenise, and rejects the same user on the same authority named twice.
+/// Different users on one authority are separate allowances.
 pub fn resolve_ssh_allowances(entries: &[AllowSshEntry]) -> Result<Vec<ResolvedSshAllowance>> {
     let mut result = Vec::with_capacity(entries.len());
-    let mut seen: Vec<String> = Vec::with_capacity(entries.len());
+    let mut seen: Vec<(Option<String>, String)> = Vec::with_capacity(entries.len());
     for entry in entries {
         let endpoint = parse_ssh_endpoint(entry.endpoint())?;
         if matches!(entry, AllowSshEntry::WithCommands(_)) && entry.commands().is_empty() {
@@ -566,17 +568,19 @@ pub fn resolve_ssh_allowances(entries: &[AllowSshEntry]) -> Result<Vec<ResolvedS
         }
         validate_ssh_commands(entry.endpoint(), entry.commands())?;
         let authority = ssh_endpoint_authority(&endpoint.host, endpoint.port);
-        if seen.contains(&authority) {
+        let identity = (endpoint.user.clone(), authority);
+        if seen.contains(&identity) {
             return Err(NonoError::ConfigParse(format!(
-                "SSH endpoint '{}' is allowed twice, both times as {authority}: the first \
-                 entry would decide the remote user and the command policy and the later one \
+                "SSH endpoint '{}' is allowed twice for the same remote user, both times as \
+                 {}: the first entry would decide the command policy and the later one \
                  would silently do nothing, so a repeat meant to narrow the endpoint would \
-                 not narrow it. Name each host and port once, carrying the user prefix and \
-                 the commands that endpoint may run",
-                entry.endpoint()
+                 not narrow it. Name each user on each host and port once, carrying the \
+                 commands that identity may run",
+                entry.endpoint(),
+                identity.1
             )));
         }
-        seen.push(authority);
+        seen.push(identity);
         result.push(ResolvedSshAllowance {
             endpoint,
             commands: entry.commands().to_vec(),
@@ -607,16 +611,21 @@ fn validate_ssh_commands(endpoint: &str, commands: &[String]) -> Result<()> {
 ///
 /// These deny rather than grant: each named port is closed on every host not
 /// listed. The endpoint itself is reached through the bastion, never through
-/// the proxy, so nothing here puts `host:port` in the allowlist.
+/// the proxy, so nothing here puts `host:port` in the allowlist. An authority
+/// allowed for several users appears once.
 ///
 /// # Errors
 ///
 /// Propagates the first [`resolve_ssh_allowances`] failure.
 pub fn ssh_pin_authorities(entries: &[AllowSshEntry]) -> Result<Vec<String>> {
-    Ok(resolve_ssh_allowances(entries)?
-        .iter()
-        .map(|allowance| ssh_endpoint_authority(&allowance.endpoint.host, allowance.endpoint.port))
-        .collect())
+    let mut authorities: Vec<String> = Vec::with_capacity(entries.len());
+    for allowance in resolve_ssh_allowances(entries)? {
+        let authority = ssh_endpoint_authority(&allowance.endpoint.host, allowance.endpoint.port);
+        if !authorities.contains(&authority) {
+            authorities.push(authority);
+        }
+    }
+    Ok(authorities)
 }
 
 /// Check if a domain is a loopback address (localhost, 127.x.x.x, ::1).
@@ -845,6 +854,23 @@ mod tests {
         assert!(
             err.contains("build.example.com:22"),
             "the refusal must name the repeated authority: {err}"
+        );
+    }
+
+    #[test]
+    fn different_users_on_one_authority_are_separate_allowances() {
+        let entries = [
+            AllowSshEntry::Plain("deploy@build.example.com".to_string()),
+            restricted(
+                "git@build.example.com:22",
+                &["git-upload-pack /srv/repo.git"],
+            ),
+        ];
+        let resolved = resolve_ssh_allowances(&entries).expect("distinct users resolve");
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(
+            ssh_pin_authorities(&entries).unwrap(),
+            vec!["build.example.com:22"]
         );
     }
 

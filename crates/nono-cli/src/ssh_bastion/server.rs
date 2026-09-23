@@ -18,6 +18,7 @@
 //! a pump task in each direction instead, and the handlers only queue.
 
 use nono::{NonoError, Result};
+use russh::MethodSet;
 use russh::server::{self, Auth, Msg, Session};
 use russh::{Channel, ChannelId, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Pty, Sig};
 use std::collections::HashMap;
@@ -227,8 +228,20 @@ impl BastionSession {
 impl server::Handler for BastionSession {
     type Error = russh::Error;
 
-    async fn auth_none(&mut self, _user: &str) -> std::result::Result<Auth, Self::Error> {
-        Ok(Auth::Accept)
+    /// Accept only the user the relay named and the parent authorized.
+    ///
+    /// The outbound leg already authenticated as that user, so a client that
+    /// now asks for another one would otherwise be sent on under an identity
+    /// it never asked for.
+    async fn auth_none(&mut self, user: &str) -> std::result::Result<Auth, Self::Error> {
+        if user == self.target.user {
+            return Ok(Auth::Accept);
+        }
+        audit::refused_user(&self.target, user);
+        Ok(Auth::Reject {
+            proceed_with_methods: Some(MethodSet::empty()),
+            partial_success: false,
+        })
     }
 
     /// Hold the client's window back while its bytes are still queued here.

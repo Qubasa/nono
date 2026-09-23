@@ -187,7 +187,19 @@ The pin is evaluated before the allowlist and before `allow_domain`, so a wildca
 
 Entries are `[user@]host[:port]`, or the object form described in [Per-Endpoint Command Allowlist](#per-endpoint-command-allowlist); both forms mix freely in one list. The port defaults to `22`. IPv6 literals must be bracketed (`[::1]:22`). Wildcards (`*.example.com`), an empty host, a non-numeric port, and a port outside 1-65535 are rejected at profile load time; the error names the offending entry.
 
-The `user@` prefix names the remote user **nono** authenticates as. `--allow-ssh deploy@build.example.com` authenticates as `deploy`; an entry with no prefix uses the username nono itself runs as, exactly as a plain `ssh host` would. The prefix has no effect on which endpoints are reachable, and the sandbox does not choose the remote identity: a sandboxed `ssh root@build.example.com` reaches the endpoint and runs there as `deploy`.
+The `user@` prefix names the remote user the sandbox may reach the endpoint as, and **nono** authenticates as that user. `--allow-ssh deploy@build.example.com` allows `ssh deploy@build.example.com`; an entry with no prefix stands for the username nono itself runs as, exactly as a plain `ssh host` would. The user is matched, never rewritten: under that allowance a sandboxed `ssh root@build.example.com` is refused with `'root' is not an allowed remote user on build.example.com:22`, and nono dials nothing. To allow several users on one endpoint, list one entry per user; each entry keeps its own command list:
+
+```json
+{
+  "network": {
+    "allow_ssh": [
+      "deploy@build.example.com",
+      { "endpoint": "git@build.example.com",
+        "commands": ["git-upload-pack /srv/repo.git"] }
+    ]
+  }
+}
+```
 
 | Key | What `build.example.com` does |
 |-----|-------------------------------|
@@ -196,7 +208,7 @@ The `user@` prefix names the remote user **nono** authenticates as. `--allow-ssh
 
 Three different refusals report this. `nono why --host other.example.com --port 22` reports `ssh_port_pinned` and names the endpoints the port is pinned to. `nono why --host build.example.com --port 22`, for the allowed endpoint itself, reports `ssh_mediated_only`: the port is reachable through the mediated session and not as raw TCP, so the pin closes it on the allowed host too. `nono why --host build.example.com --port 443`, on a policy that is already filtering, reports `proxy_filtered`, because an SSH allowance puts nothing in the proxy allowlist and the host is not otherwise allowed. Configured endpoints appear in `nono profile show`, `nono profile show --json` (key `allow_ssh` under `network`), `nono profile diff` (also with `--json`), and `nono why --self`.
 
-Across profile inheritance, `allow_ssh` merges like `allow_domain` rather than being a flat append: entries are keyed by endpoint, base order first and child-only endpoints after, and command lists for the same endpoint are unioned. A plain entry beside a restricted one for the same endpoint becomes restricted, so a child profile narrowing an inherited endpoint to a command list actually narrows it. Naming the same `host:port` twice in one effective list is a load error, including when a `--allow-ssh` flag repeats an endpoint the profile already names, or when two entries differ only in their `user@` prefix: there is one remote identity per endpoint and nono will not pick silently.
+Across profile inheritance, `allow_ssh` merges like `allow_domain` rather than being a flat append: entries are keyed by endpoint, base order first and child-only endpoints after, and command lists for the same endpoint are unioned. A plain entry beside a restricted one for the same endpoint becomes restricted, so a child profile narrowing an inherited endpoint to a command list actually narrows it. Naming the same user on the same `host:port` twice in one effective list is a load error, including when a `--allow-ssh` flag repeats an entry the profile already names, or when an entry with no prefix and one spelling out the username nono runs as land on the same endpoint. Different users on one endpoint are separate entries.
 
 #### What the Session May Do
 
@@ -251,12 +263,12 @@ When `allow_ssh` is active, nono materialises a generated OpenSSH config in a se
 
 ```
 Host *
-  ProxyCommand /path/to/nono ssh-relay %h %p
+  ProxyCommand /path/to/nono ssh-relay %h %p %r
   StrictHostKeyChecking yes
   UserKnownHostsFile <session-dir>/known_hosts
 ```
 
-`nono ssh-relay` is a hidden helper subcommand that exists for this `ProxyCommand`; it is not a user-facing command. It connects to the session's unix socket and copies stdio both ways, and that is all it does: it holds no policy and no credential, because the SSH session it carries terminates at nono in the parent process, outside the sandbox. Two environment tweaks point clients at the generated config:
+`nono ssh-relay` is a hidden helper subcommand that exists for this `ProxyCommand`; it is not a user-facing command. It connects to the session's unix socket, names the host, port and remote user the client asked for, and copies stdio both ways, and that is all it does: it holds no policy and no credential, because the SSH session it carries terminates at nono in the parent process, outside the sandbox. Two environment tweaks point clients at the generated config:
 
 - `GIT_SSH_COMMAND="ssh -F <config>"`, so `git clone ssh://…` works unmodified.
 - `RSYNC_RSH="ssh -F <config>"`, so `rsync host:path .` works unmodified. rsync has no config flag of its own.

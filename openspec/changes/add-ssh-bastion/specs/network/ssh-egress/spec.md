@@ -6,12 +6,18 @@ An SSH allowance MUST be expressed as `[user@]host[:port]`, where the port
 defaults to 22, so an SSH target copied from a shell command can be pasted
 verbatim. The allowance MUST permit that host on that port only.
 
-The `user@` prefix MUST name the remote identity the mediation authenticates
-as. A sandboxed client MUST NOT be able to select a different remote identity,
-whatever user name it asks for, because the credential is held outside the
-sandbox and the mediation chooses which identity to present with it. An
-allowance that names no user MUST authenticate as the user nono itself runs as,
-matching what a bare `ssh host` would send.
+The `user@` prefix MUST name the remote identity the allowance permits, and the
+mediation MUST authenticate as exactly that identity. A sandboxed client asking
+for a remote user that no allowance names on that endpoint MUST be refused
+before anything is dialled, with a message naming the requested user and the
+identities that are allowed there; the mediation MUST NOT substitute another
+user. The user the client authenticates as on the sandbox-facing leg MUST be
+the one it asked for. An allowance that names no user MUST stand for the user
+nono itself runs as, matching what a bare `ssh host` would send.
+
+Several allowances MAY name the same endpoint for different users, and each
+MUST keep its own command policy. Two allowances resolving to the same user on
+the same endpoint MUST be refused at load or startup.
 
 An allowance MAY instead be written as an object naming the same endpoint plus
 the exact commands that endpoint may run. Both forms MUST be accepted in the
@@ -42,13 +48,23 @@ allowances emit, because the port is not ignored.
 
 - **WHEN** a profile allows SSH to `deploy@build.example.com` and a sandboxed
   process runs `ssh root@build.example.com`
-- **THEN** the session still authenticates as `deploy`, because the remote
-  identity is the allowance's and not the client's
+- **THEN** the session is refused with a message naming `root` as not allowed
+  and `deploy@build.example.com:22` as the allowed identity, and no outbound
+  connection is made
+
+#### Scenario: Two users on one endpoint
+
+- **WHEN** a profile allows SSH to `deploy@build.example.com` and to
+  `git@build.example.com` restricted to `git-upload-pack /srv/repo.git`
+- **THEN** `ssh deploy@build.example.com` runs with the default session
+  policy, `ssh git@build.example.com` runs only the named command, and any
+  other user is refused
 
 #### Scenario: Allowance without a user
 
 - **WHEN** a profile allows SSH to `build.example.com` with no user prefix
-- **THEN** the session authenticates as the user nono runs as
+- **THEN** a session as the user nono runs as authenticates as that user, and a
+  session asking for any other user is refused
 
 #### Scenario: SSH target pasted with a user prefix
 

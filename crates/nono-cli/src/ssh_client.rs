@@ -165,7 +165,7 @@ pub(crate) fn prepare_ssh_client_files(nono_exe: &Path) -> Result<SshClientFiles
     // instead of a bare EACCES from a direct connect.
     let config = format!(
         "Host *\n  \
-         ProxyCommand {nono} ssh-relay %h %p\n  \
+         ProxyCommand {nono} ssh-relay %h %p %r\n  \
          StrictHostKeyChecking yes\n  \
          UserKnownHostsFile {known_hosts}\n  \
          IdentityAgent none\n  \
@@ -350,7 +350,7 @@ mod tests {
         let files = prepare_ssh_client_files(&exe).expect("prepare ssh client files");
         let config = std::fs::read_to_string(files.config_path()).expect("read config");
         assert!(config.starts_with("Host *\n"));
-        assert!(config.contains("ProxyCommand '/opt/nono bin/nono' ssh-relay %h %p"));
+        assert!(config.contains("ProxyCommand '/opt/nono bin/nono' ssh-relay %h %p %r"));
         assert!(
             !config.contains("ssh-tunnel"),
             "the raw tunnel route is gone: {config}"

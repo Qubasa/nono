@@ -33,7 +33,7 @@ pub(crate) mod credential;
 pub(crate) mod policy;
 pub(crate) mod server;
 
-use crate::network_policy::{ResolvedSshAllowance, SshEndpoint};
+use crate::network_policy::{ResolvedSshAllowance, SshEndpoint, ssh_endpoint_authority};
 use nono::{NonoError, Result};
 use policy::{EndpointRule, RefusedRequest};
 use std::path::{Path, PathBuf};
@@ -45,11 +45,13 @@ use tokio::sync::Semaphore;
 
 pub(crate) use credential::{AGENT_SOCK_ENV, SshCredential};
 
-/// First line the relay sends: which endpoint the client asked for.
+/// First line the relay sends: which endpoint and remote user the client asked
+/// for.
 ///
-/// It arrives from inside the sandbox as `%h %p`, so it is a request and not a
-/// fact. The parent matches it against the resolved allowances before dialling
-/// anything, which is where the port-exact guarantee is actually kept.
+/// It arrives from inside the sandbox as `%h %p %r`, so it is a request and not
+/// a fact. The parent matches it against the resolved allowances before
+/// dialling anything, which is where the port-exact and user-exact guarantees
+/// are actually kept.
 pub(crate) const TARGET_PREAMBLE: &str = "NONO-SSH-TARGET";
 /// Reply meaning the endpoint was allowed and SSH bytes follow.
 pub(crate) const ACCEPTED_REPLY: &str = "NONO-SSH-OK";
@@ -98,7 +100,7 @@ pub(crate) fn escape_for_display(text: &str) -> String {
     out
 }
 
-/// One authorized endpoint plus what it may do there.
+/// One authorized endpoint plus the remote user and what it may do there.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionTarget {
     pub(crate) endpoint: SshEndpoint,
@@ -108,40 +110,80 @@ pub(crate) struct SessionTarget {
 
 impl SessionTarget {
     pub(crate) fn describe(&self) -> String {
-        format!(
-            "{}@{}:{}",
-            self.user, self.endpoint.host, self.endpoint.port
-        )
+        format!("{}@{}", self.user, self.authority())
+    }
+
+    fn authority(&self) -> String {
+        ssh_endpoint_authority(&self.endpoint.host, self.endpoint.port)
     }
 }
 
-/// The allowances in force, resolved once in the parent.
-#[derive(Debug, Clone)]
-pub(crate) struct Allowances(Arc<Vec<ResolvedSshAllowance>>);
+/// What the relay asked for: an endpoint and the remote user to reach it as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetRequest {
+    host: String,
+    port: u16,
+    user: String,
+}
 
-impl Allowances {
-    pub(crate) fn new(allowances: Vec<ResolvedSshAllowance>) -> Self {
-        Self(Arc::new(allowances))
+/// Why a [`TargetRequest`] matched no allowance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetRefusal {
+    /// No allowance names the endpoint at all.
+    Endpoint,
+    /// The endpoint is allowed, but not as the requested user. Carries the
+    /// identities that are allowed there.
+    User(Vec<String>),
+}
+
+impl TargetRefusal {
+    /// The line the client sees, naming what is allowed instead.
+    fn message(&self, request: &TargetRequest, allowances: &Allowances) -> String {
+        match self {
+            Self::Endpoint => format!(
+                "{}:{} is not an allowed SSH endpoint. Allowed: {}",
+                escape_for_display(&request.host),
+                request.port,
+                allowances.describe_all()
+            ),
+            Self::User(allowed) => format!(
+                "'{}' is not an allowed remote user on {}. Allowed there: {}",
+                escape_for_display(&request.user),
+                escape_for_display(&ssh_endpoint_authority(&request.host, request.port)),
+                allowed.join(", ")
+            ),
+        }
     }
 
-    /// Match a requested `host:port` against the allowances, port-exactly.
+    fn audit_reason(&self) -> &'static str {
+        match self {
+            Self::Endpoint => "no allowance covers the endpoint",
+            Self::User(_) => "no allowance names that remote user on the endpoint",
+        }
+    }
+}
+
+/// The allowances in force, resolved once in the parent with every remote user
+/// filled in.
+#[derive(Debug, Clone)]
+pub(crate) struct Allowances(Arc<Vec<SessionTarget>>);
+
+impl Allowances {
+    /// Resolve each allowance to the concrete identity it authorizes.
     ///
-    /// The remote user is the allowance's, never the client's: the sandbox
-    /// chooses which allowed endpoint to reach, not which identity to reach it
-    /// as, which is what makes `ssh root@allowed-host` run as the allowance
-    /// says rather than as root.
-    fn authorize(&self, host: &str, port: u16, default_user: &str) -> Option<SessionTarget> {
-        let requested = crate::network_policy::ssh_endpoint_authority(host, port);
-        self.0
-            .iter()
-            .find(|allowance| {
-                crate::network_policy::ssh_endpoint_authority(
-                    &allowance.endpoint.host,
-                    allowance.endpoint.port,
-                ) == requested
-            })
-            .map(|allowance| SessionTarget {
-                endpoint: allowance.endpoint.clone(),
+    /// An allowance that names no user stands for `default_user`, exactly as
+    /// a bare `ssh host` would.
+    ///
+    /// # Errors
+    ///
+    /// Refuses two allowances that resolve to the same user on the same
+    /// endpoint, such as `build.example.com` and `alice@build.example.com`
+    /// when nono runs as `alice`. Which one's command policy applied would
+    /// otherwise depend on their order.
+    pub(crate) fn new(allowances: Vec<ResolvedSshAllowance>, default_user: &str) -> Result<Self> {
+        let mut targets: Vec<SessionTarget> = Vec::with_capacity(allowances.len());
+        for allowance in allowances {
+            let target = SessionTarget {
                 user: allowance
                     .endpoint
                     .user
@@ -150,20 +192,55 @@ impl Allowances {
                 rule: if allowance.commands.is_empty() {
                     EndpointRule::Session
                 } else {
-                    EndpointRule::Commands(allowance.commands.clone())
+                    EndpointRule::Commands(allowance.commands)
                 },
-            })
+                endpoint: allowance.endpoint,
+            };
+            let identity = target.describe();
+            if targets.iter().any(|known| known.describe() == identity) {
+                return Err(NonoError::ConfigParse(format!(
+                    "SSH endpoint {identity} is allowed twice: an entry without a user@ prefix \
+                     stands for the user nono runs as, so it names the same remote identity as \
+                     an entry that spells that user out. Keep one entry per user and endpoint"
+                )));
+            }
+            targets.push(target);
+        }
+        Ok(Self(Arc::new(targets)))
+    }
+
+    /// Match a requested `user@host:port` against the allowances, port-exactly
+    /// and user-exactly.
+    ///
+    /// The remote user is part of what is authorized and is never rewritten:
+    /// under an allowance for `deploy@allowed-host`, a sandboxed
+    /// `ssh root@allowed-host` is refused rather than sent on as `deploy`.
+    fn authorize(
+        &self,
+        request: &TargetRequest,
+    ) -> std::result::Result<SessionTarget, TargetRefusal> {
+        let authority = ssh_endpoint_authority(&request.host, request.port);
+        let mut allowed_here = Vec::new();
+        for target in self.0.iter() {
+            if target.authority() != authority {
+                continue;
+            }
+            if target.user == request.user {
+                return Ok(target.clone());
+            }
+            allowed_here.push(target.describe());
+        }
+        if allowed_here.is_empty() {
+            Err(TargetRefusal::Endpoint)
+        } else {
+            Err(TargetRefusal::User(allowed_here))
+        }
     }
 
     fn describe_all(&self) -> String {
         self.0
             .iter()
-            .map(|allowance| {
-                crate::network_policy::ssh_endpoint_authority(
-                    &allowance.endpoint.host,
-                    allowance.endpoint.port,
-                )
-            })
+            .map(SessionTarget::describe)
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -193,7 +270,6 @@ pub(crate) struct BastionConfig {
     pub(crate) known_hosts: PathBuf,
     pub(crate) allowances: Allowances,
     pub(crate) credential: SshCredential,
-    pub(crate) default_user: String,
 }
 
 /// Bind the socket and serve mediated sessions on `runtime` until the process
@@ -238,7 +314,6 @@ pub(crate) fn start(
         known_hosts: config.known_hosts,
         allowances: config.allowances,
         credential: config.credential,
-        default_user: config.default_user,
         server: server_config,
         sessions: Arc::new(Semaphore::new(MAX_CONCURRENT_SESSIONS)),
     });
@@ -284,29 +359,29 @@ struct SharedConfig {
     known_hosts: PathBuf,
     allowances: Allowances,
     credential: SshCredential,
-    default_user: String,
     server: Arc<russh::server::Config>,
     sessions: Arc<Semaphore>,
 }
 
 async fn handle_connection(shared: Arc<SharedConfig>, mut stream: UnixStream) -> Result<()> {
-    let (host, port) = read_target(&mut stream).await?;
+    let request = read_target(&mut stream).await?;
 
-    let Some(target) = shared
-        .allowances
-        .authorize(&host, port, &shared.default_user)
-    else {
-        let message = format!(
-            "{}:{port} is not an allowed SSH endpoint. Allowed: {}",
-            escape_for_display(&host),
-            shared.allowances.describe_all()
-        );
-        audit::refused_endpoint(&host, port);
-        let _ = stream
-            .write_all(format!("{DENIED_REPLY} {message}\n").as_bytes())
-            .await;
-        let _ = stream.flush().await;
-        return Ok(());
+    let target = match shared.allowances.authorize(&request) {
+        Ok(target) => target,
+        Err(refusal) => {
+            let message = refusal.message(&request, &shared.allowances);
+            audit::refused_target(
+                &request.host,
+                request.port,
+                &request.user,
+                refusal.audit_reason(),
+            );
+            let _ = stream
+                .write_all(format!("{DENIED_REPLY} {message}\n").as_bytes())
+                .await;
+            let _ = stream.flush().await;
+            return Ok(());
+        }
     };
 
     let outbound = match client::connect(
@@ -340,7 +415,7 @@ async fn handle_connection(shared: Arc<SharedConfig>, mut stream: UnixStream) ->
 ///
 /// Byte at a time on purpose: the SSH identification banner is already on its
 /// way behind this line, and a buffered read would swallow part of it.
-async fn read_target(stream: &mut UnixStream) -> Result<(String, u16)> {
+async fn read_target(stream: &mut UnixStream) -> Result<TargetRequest> {
     let line = tokio::time::timeout(TARGET_LINE_TIMEOUT, read_target_line(stream))
         .await
         .map_err(|_| {
@@ -381,10 +456,11 @@ async fn read_target_line(stream: &mut UnixStream) -> Result<String> {
     })
 }
 
-fn parse_target(line: &str) -> Result<(String, u16)> {
+fn parse_target(line: &str) -> Result<TargetRequest> {
     let malformed = || {
         NonoError::SshBastion(format!(
-            "ssh bastion received a malformed target line: '{line}'"
+            "ssh bastion received a malformed target line: '{}'",
+            escape_for_display(line)
         ))
     };
     let mut fields = line.trim_end_matches('\r').split(' ');
@@ -393,11 +469,16 @@ fn parse_target(line: &str) -> Result<(String, u16)> {
     }
     let host = fields.next().ok_or_else(malformed)?;
     let port = fields.next().ok_or_else(malformed)?;
-    if fields.next().is_some() || host.is_empty() {
+    let user = fields.next().ok_or_else(malformed)?;
+    if fields.next().is_some() || host.is_empty() || user.is_empty() {
         return Err(malformed());
     }
     let port: u16 = port.parse().map_err(|_| malformed())?;
-    Ok((host.to_string(), port))
+    Ok(TargetRequest {
+        host: host.to_string(),
+        port,
+        user: user.to_string(),
+    })
 }
 
 /// Audit lines for every authorization decision.
@@ -471,10 +552,22 @@ pub(crate) mod audit {
         );
     }
 
-    pub(crate) fn refused_endpoint(host: &str, port: u16) {
+    pub(crate) fn refused_target(host: &str, port: u16, user: &str, reason: &str) {
         tracing::warn!(
-            "ssh bastion refused the endpoint {}:{port}: no allowance covers it",
+            "ssh bastion refused {}@{}:{port}: {reason}",
+            escape_for_display(user),
             escape_for_display(host)
+        );
+    }
+
+    /// Record a client authenticating as a user other than the one the
+    /// session was authorized for.
+    pub(crate) fn refused_user(target: &SessionTarget, requested: &str) {
+        tracing::warn!(
+            "ssh bastion refused userauth as '{}' on {}: the session was authorized for '{}'",
+            escape_for_display(requested),
+            target.describe(),
+            target.user
         );
     }
 }
@@ -482,7 +575,6 @@ pub(crate) mod audit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network_policy::ResolvedSshAllowance;
 
     fn allowance(
         user: Option<&str>,
@@ -500,86 +592,157 @@ mod tests {
         }
     }
 
+    fn allow(entries: Vec<ResolvedSshAllowance>) -> Allowances {
+        Allowances::new(entries, "local").expect("distinct identities resolve")
+    }
+
+    fn request(user: &str, host: &str, port: u16) -> TargetRequest {
+        TargetRequest {
+            host: host.to_string(),
+            port,
+            user: user.to_string(),
+        }
+    }
+
     #[test]
-    fn the_allowance_decides_the_remote_user_not_the_client() {
-        let allowances = Allowances::new(vec![allowance(
+    fn the_allowed_user_is_authorized_as_itself() {
+        let allowances = allow(vec![allowance(
             Some("deploy"),
             "build.example.com",
             22,
             &[],
         )]);
         let target = allowances
-            .authorize("build.example.com", 22, "local")
-            .expect("the allowed endpoint must authorize");
+            .authorize(&request("deploy", "build.example.com", 22))
+            .expect("the allowed identity must authorize");
         assert_eq!(target.user, "deploy");
     }
 
     #[test]
-    fn an_allowance_without_a_user_falls_back_to_nonos_own() {
-        let allowances = Allowances::new(vec![allowance(None, "build.example.com", 22, &[])]);
+    fn another_user_on_an_allowed_endpoint_is_refused_not_rewritten() {
+        let allowances = allow(vec![allowance(
+            Some("deploy"),
+            "build.example.com",
+            22,
+            &[],
+        )]);
+        let refusal = allowances
+            .authorize(&request("root", "build.example.com", 22))
+            .expect_err("root was never allowed");
+        assert_eq!(
+            refusal,
+            TargetRefusal::User(vec!["deploy@build.example.com:22".to_string()])
+        );
+        let message = refusal.message(&request("root", "build.example.com", 22), &allowances);
+        assert!(message.contains("'root'"), "{message}");
+        assert!(message.contains("deploy@build.example.com:22"), "{message}");
+    }
+
+    #[test]
+    fn each_user_on_one_endpoint_keeps_its_own_rule() {
+        let allowances = allow(vec![
+            allowance(Some("deploy"), "build.example.com", 22, &[]),
+            allowance(
+                Some("git"),
+                "build.example.com",
+                22,
+                &["git-upload-pack /srv/repo.git"],
+            ),
+        ]);
+        let deploy = allowances
+            .authorize(&request("deploy", "build.example.com", 22))
+            .expect("deploy is allowed");
+        assert_eq!(deploy.rule, EndpointRule::Session);
+        let git = allowances
+            .authorize(&request("git", "build.example.com", 22))
+            .expect("git is allowed");
+        assert_eq!(
+            git.rule,
+            EndpointRule::Commands(vec!["git-upload-pack /srv/repo.git".to_string()])
+        );
+        assert!(
+            allowances
+                .authorize(&request("root", "build.example.com", 22))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_allowance_without_a_user_allows_only_nonos_own() {
+        let allowances = allow(vec![allowance(None, "build.example.com", 22, &[])]);
         let target = allowances
-            .authorize("build.example.com", 22, "local")
-            .expect("the allowed endpoint must authorize");
+            .authorize(&request("local", "build.example.com", 22))
+            .expect("nono's own user must authorize");
         assert_eq!(target.user, "local");
+        assert!(
+            allowances
+                .authorize(&request("root", "build.example.com", 22))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_bare_entry_and_one_naming_nonos_own_user_collide() {
+        let err = Allowances::new(
+            vec![
+                allowance(None, "build.example.com", 22, &[]),
+                allowance(
+                    Some("local"),
+                    "build.example.com",
+                    22,
+                    &["git-upload-pack /srv/repo.git"],
+                ),
+            ],
+            "local",
+        )
+        .expect_err("two entries for one identity must be refused")
+        .to_string();
+        assert!(err.contains("local@build.example.com:22"), "{err}");
     }
 
     #[test]
     fn a_port_the_allowance_does_not_name_is_refused() {
-        let allowances = Allowances::new(vec![allowance(None, "build.example.com", 2222, &[])]);
-        assert!(
+        let allowances = allow(vec![allowance(None, "build.example.com", 2222, &[])]);
+        assert_eq!(
             allowances
-                .authorize("build.example.com", 22, "local")
-                .is_none()
+                .authorize(&request("local", "build.example.com", 22))
+                .expect_err("port 22 was never allowed"),
+            TargetRefusal::Endpoint
         );
         assert!(
             allowances
-                .authorize("build.example.com", 2222, "local")
-                .is_some()
+                .authorize(&request("local", "build.example.com", 2222))
+                .is_ok()
         );
     }
 
     #[test]
     fn a_second_host_is_refused() {
-        let allowances = Allowances::new(vec![allowance(None, "build.example.com", 22, &[])]);
-        assert!(
-            allowances
-                .authorize("other.example.com", 22, "local")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_command_list_makes_the_endpoint_a_task_endpoint() {
-        let allowances = Allowances::new(vec![allowance(
-            None,
-            "build.example.com",
-            22,
-            &["git-upload-pack /srv/repo.git"],
-        )]);
-        let target = allowances
-            .authorize("build.example.com", 22, "local")
-            .expect("the allowed endpoint must authorize");
+        let allowances = allow(vec![allowance(None, "build.example.com", 22, &[])]);
         assert_eq!(
-            target.rule,
-            EndpointRule::Commands(vec!["git-upload-pack /srv/repo.git".to_string()])
+            allowances
+                .authorize(&request("local", "other.example.com", 22))
+                .expect_err("the host was never allowed"),
+            TargetRefusal::Endpoint
         );
     }
 
     #[test]
     fn the_target_line_round_trips() {
-        let (host, port) =
-            parse_target(&format!("{TARGET_PREAMBLE} build.example.com 2222")).expect("parses");
-        assert_eq!((host.as_str(), port), ("build.example.com", 2222));
+        let parsed = parse_target(&format!("{TARGET_PREAMBLE} build.example.com 2222 deploy"))
+            .expect("parses");
+        assert_eq!(parsed, request("deploy", "build.example.com", 2222));
     }
 
     #[test]
     fn a_malformed_target_line_is_refused() {
         for line in [
-            "GARBAGE host 22",
-            &format!("{TARGET_PREAMBLE} host"),
-            &format!("{TARGET_PREAMBLE} host 22 extra"),
-            &format!("{TARGET_PREAMBLE}  22"),
-            &format!("{TARGET_PREAMBLE} host 99999"),
+            "GARBAGE host 22 user",
+            &format!("{TARGET_PREAMBLE} host 22"),
+            &format!("{TARGET_PREAMBLE} host 22 user extra"),
+            &format!("{TARGET_PREAMBLE}  22 user"),
+            &format!("{TARGET_PREAMBLE} host 22 "),
+            &format!("{TARGET_PREAMBLE} host 99999 user"),
         ] {
             assert!(
                 parse_target(line).is_err(),

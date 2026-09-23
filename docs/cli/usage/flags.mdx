@@ -403,7 +403,7 @@ The route is a mediated SSH session, not a tunnel. The sandboxed client speaks S
 
 Only `session` channels run, which means `shell`, `exec`, `pty-req`, `window-change`, `subsystem` and `signal`. Every forwarding request is refused with the request type named: `direct-tcpip` (`-L`, `-D`, `-J`), `tcpip-forward` (`-R`), `auth-agent-req@openssh.com` (`-A`) and `x11-req` (`-X`, `-Y`). `sftp`, `scp` and `rsync -e ssh` keep working, because each is a subsystem or a remote command.
 
-The `user@` prefix names the remote user nono authenticates as; without one, nono uses the account name of the uid it runs as, exactly as a plain `ssh host` would. The sandbox does not choose the remote identity, so under `--allow-ssh deploy@build.example.com` a sandboxed `ssh root@build.example.com` still runs as `deploy`. If that uid has no account name, startup fails and the error asks for an explicit `user@` in the allowance rather than guessing.
+The `user@` prefix names the remote user the sandbox may reach the endpoint as, and nono authenticates as that user; without one, it is the account name of the uid nono runs as, exactly as a plain `ssh host` would use. Any other user is refused, not rewritten: under `--allow-ssh deploy@build.example.com` a sandboxed `ssh root@build.example.com` fails with `'root' is not an allowed remote user`. Repeat the flag with another `user@` to allow a second user on the same endpoint. If that uid has no account name, startup fails and the error asks for an explicit `user@` in the allowance rather than guessing.
 
 nono authenticates from outside the sandbox, with `--ssh-key` or the host's `SSH_AUTH_SOCK`, and checks the endpoint's host key against your `~/.ssh/known_hosts` itself. The sandbox needs no grant for a key file or an agent socket.
 
@@ -411,11 +411,11 @@ nono authenticates from outside the sandbox, with `--ssh-key` or the host's `SSH
 # Allow git over SSH to one build host (port 22)
 nono run --allow-cwd --allow-ssh build.example.com -- git fetch
 
-# Non-default port; the user@ prefix picks the remote user. `ssh` has to be
+# Non-default port; the client must ask for the user the allowance names. `ssh` has to be
 # resolved inside the sandbox to pick up the generated config, so go through a
 # shell: a top-level `-- ssh …` is resolved against the host PATH beforehand.
 nono run --allow-cwd --allow-ssh deploy@other.example.com:2222 \
-  -- sh -c 'ssh -p 2222 other.example.com'
+  -- sh -c 'ssh -p 2222 deploy@other.example.com'
 ```
 
 In a profile an entry may instead be an object carrying a `commands` list, which restricts that endpoint to those exact command lines and refuses `shell`, `pty-req` and `subsystem` there. See [Per-Endpoint Command Allowlist](/cli/features/networking#per-endpoint-command-allowlist).

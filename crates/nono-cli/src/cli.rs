@@ -676,9 +676,10 @@ IN-BAND DETACH:
 
 /// Arguments for the hidden `nono ssh-relay` helper.
 ///
-/// OpenSSH substitutes `%h` and `%p` into the configured `ProxyCommand`, so
-/// the host and port arrive as plain positionals. They come from inside the
-/// sandbox, so the parent re-checks them against the allowances.
+/// OpenSSH substitutes `%h`, `%p` and `%r` into the configured `ProxyCommand`,
+/// so the host, port and remote user arrive as plain positionals. They come
+/// from inside the sandbox, so the parent re-checks them against the
+/// allowances.
 #[derive(Parser, Debug)]
 pub struct SshRelayArgs {
     /// Target host (OpenSSH `%h`)
@@ -686,6 +687,9 @@ pub struct SshRelayArgs {
 
     /// Target port (OpenSSH `%p`)
     pub port: u16,
+
+    /// Remote user (OpenSSH `%r`)
+    pub user: String,
 }
 
 #[derive(Parser, Debug)]

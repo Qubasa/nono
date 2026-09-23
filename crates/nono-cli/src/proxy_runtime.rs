@@ -3224,9 +3224,9 @@ pub(crate) fn start_proxy_runtime(
                 known_hosts: user_known_hosts_path()?,
                 allowances: crate::ssh_bastion::Allowances::new(
                     network_policy::resolve_ssh_allowances(allow_ssh)?,
-                ),
+                    &default_remote_user()?,
+                )?,
                 credential: crate::ssh_bastion::credential::resolve(proxy.ssh_key.as_deref())?,
-                default_user: default_remote_user()?,
             },
         )?;
 

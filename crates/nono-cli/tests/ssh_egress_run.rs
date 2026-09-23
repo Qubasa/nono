@@ -337,16 +337,15 @@ impl Sshd {
         .expect("home is a fresh dir this test owns");
     }
 
-    /// The endpoint as an allowance names it: the remote identity is nono's
-    /// choice, not the client's, so it belongs in the profile.
+    /// The endpoint as an allowance names it, including the one remote user
+    /// the sandbox may reach it as.
     fn allowance(&self) -> String {
         format!("{}@127.0.0.1:{}", self.user, self.port)
     }
 
-    /// What the sandboxed client types. It does carry a user, and that user is
-    /// deliberately the same one the allowance names, so the mediated tests
-    /// stay about what they are about. The substitution itself is exercised by
-    /// `the_remote_identity_is_the_allowances_and_not_the_clients`.
+    /// What the sandboxed client types. It carries the user the allowance
+    /// names, because any other user is refused. The refusal itself is
+    /// exercised by `a_remote_user_the_allowance_does_not_name_is_refused`.
     fn target(&self) -> String {
         format!("{}@127.0.0.1", self.user)
     }
@@ -1261,6 +1260,7 @@ fn ssh_relay_without_a_bastion_fails_instead_of_connecting_directly() {
         .arg("ssh-relay")
         .arg("127.0.0.1")
         .arg(server.port.to_string())
+        .arg("deploy")
         .env_remove("NONO_SSH_BASTION")
         .output()
         .expect("run ssh-relay");
@@ -1280,28 +1280,88 @@ fn ssh_relay_without_a_bastion_fails_instead_of_connecting_directly() {
     );
 }
 
-/// The remote identity is the allowance's and the sandbox cannot choose
-/// another one. Every other mediated test names the same user on both sides,
-/// where the substitution is unobservable, so this is the only place the
-/// headline behaviour of the change is actually exercised.
+/// The remote user is part of the allowance and is never rewritten: asking for
+/// a user the allowance does not name is refused before anything is dialled,
+/// with a message naming the user and the identity that is allowed.
 #[test]
-fn the_remote_identity_is_the_allowances_and_not_the_clients() {
+fn a_remote_user_the_allowance_does_not_name_is_refused() {
     let t = nono_test!("ssh-user");
     let state = ShortState::new(&t);
     let Some(sshd) = Sshd::start(&t) else { return };
+    if sshd.user == "root" {
+        return;
+    }
     let profile = t.write_profile("ssh-user", &filtered_profile(&sshd.allowance()));
 
-    let completed = mediated(&t, &state, &sshd)
+    mediated(&t, &state, &sshd)
         .profile(&profile)
         .exec(shell(&format!(
-            "ssh -p {} root@127.0.0.1 'id -un'",
+            "ssh -p {} root@127.0.0.1 'echo reached-as-root; id -un'",
             sshd.port
         )))
-        .assert_success("asking for another remote user must not break the session")
-        .assert_stdout_contains(&sshd.user);
-    if sshd.user != "root" {
-        completed.assert_stdout_lacks("root");
+        .assert_failure("a user the allowance does not name must be refused")
+        .assert_stdout_lacks("reached-as-root")
+        .assert_stderr_contains("'root' is not an allowed remote user")
+        .assert_stderr_contains(&format!("{}@127.0.0.1:{}", sshd.user, sshd.port));
+}
+
+/// Two users on one endpoint are two allowances, each with its own rule, and
+/// the user the client asks for picks which one applies.
+#[test]
+fn the_requested_user_selects_its_own_allowance() {
+    let t = nono_test!("ssh-users");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    if sshd.user == "root" {
+        return;
     }
+    // The restricted root entry comes first, so a match that ignored the user
+    // would pick it and refuse `id -un`.
+    let profile = t.write_profile(
+        "ssh-users",
+        &profile_json(&format!(
+            r#"{{"allow_domain":["example.invalid"],"allow_ssh":[{{"endpoint":"root@127.0.0.1:{port}","commands":["true"]}},"{allowed}"]}}"#,
+            port = sshd.port,
+            allowed = sshd.allowance(),
+        )),
+    );
+
+    mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "ssh -p {} {} 'id -un'",
+            sshd.port,
+            sshd.target()
+        )))
+        .assert_success("the named user must still reach the endpoint")
+        .assert_stdout_contains(&sshd.user);
+}
+
+/// The relay's target line and the SSH userauth both name the user. A client
+/// that names the allowed user to the relay and then logs in as another must
+/// be refused, or the target line alone would decide the identity.
+#[test]
+fn a_userauth_user_other_than_the_authorized_one_is_refused() {
+    let t = nono_test!("ssh-userauth");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    if sshd.user == "root" {
+        return;
+    }
+    let profile = t.write_profile("ssh-userauth", &filtered_profile(&sshd.allowance()));
+
+    mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "ssh -o 'ProxyCommand {nono} ssh-relay %h %p {user}' -p {port} root@127.0.0.1 \
+             'echo reached-as-root'",
+            nono = nono_bin().display(),
+            user = sshd.user,
+            port = sshd.port,
+        )))
+        .assert_failure("a userauth user the relay did not name must be refused")
+        .assert_stdout_lacks("reached-as-root")
+        .assert_stderr_contains("Permission denied (");
 }
 
 /// The metacharacter refusal is covered as a pure function and never on the

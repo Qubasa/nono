@@ -902,7 +902,7 @@
               { "$ref": "#/$defs/AllowSshWithCommands" }
             ]
           },
-          "description": "SSH endpoints the sandbox may reach, as [user@]host[:port] or as an object naming the endpoint and the exact commands it may run. Port-exact: the port defaults to 22 and no other port on that host is opened, unlike allow_domain. Wildcards are rejected. The user prefix names the remote identity nono authenticates as. Activates proxy mode on its own."
+          "description": "SSH endpoints the sandbox may reach, as [user@]host[:port] or as an object naming the endpoint and the exact commands it may run. Port-exact: the port defaults to 22 and no other port on that host is opened, unlike allow_domain. Wildcards are rejected. The user prefix names the one remote user the sandbox may reach the endpoint as (default: the user nono runs as); other users are refused. List one entry per user to allow several. Activates proxy mode on its own."
         },
         "credentials": {
           "type": "array",
