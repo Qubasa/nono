@@ -9,6 +9,10 @@ use nono_test_support::{Argv, nono_test};
 use std::fs;
 use std::path::Path;
 
+fn pwd() -> Argv {
+    Argv::new(nono_test_support::host_executable("pwd").expect("pwd is on every supported host"))
+}
+
 /// Corrupt the ledger by dropping the newline between the last two records so one line holds two
 /// JSON objects and `serde_json` fails with "trailing characters".
 fn corrupt_last_newline(path: &Path) {
@@ -51,7 +55,8 @@ fn corrupt_audit_ledger_downgrades_only_a_clean_exit() {
     // Create the ledger.
     t.run()
         .allow_cwd()
-        .exec("/bin/pwd")
+        .nix_runtime()
+        .exec(pwd())
         .assert_success("seed run should succeed");
 
     let ledger = t.audit_root().join("ledger.ndjson");
@@ -60,11 +65,13 @@ fn corrupt_audit_ledger_downgrades_only_a_clean_exit() {
 
     t.run()
         .allow_cwd()
-        .exec("/bin/pwd")
+        .nix_runtime()
+        .exec(pwd())
         .assert_exit_code(1, "an unrecorded run must not exit 0");
 
     t.run()
         .allow_cwd()
+        .nix_runtime()
         .exec(Argv::new("/bin/sh").arg("-c").arg("exit 7"))
         .assert_exit_code(7, "the child's own code must survive a corrupt ledger");
 }
@@ -75,7 +82,8 @@ fn corrupt_audit_ledger_is_reported_on_every_run_and_left_untouched() {
 
     t.run()
         .allow_cwd()
-        .exec("/bin/pwd")
+        .nix_runtime()
+        .exec(pwd())
         .assert_success("seed run should succeed");
 
     let ledger = t.audit_root().join("ledger.ndjson");
@@ -85,7 +93,8 @@ fn corrupt_audit_ledger_is_reported_on_every_run_and_left_untouched() {
     for attempt in 1..=2 {
         t.run()
             .allow_cwd()
-            .exec("/bin/pwd")
+            .nix_runtime()
+            .exec(pwd())
             .assert_stderr_contains("not recorded in the audit ledger")
             // Printed only for a ledger that no longer parses, so it also pins that the permanent
             // story is not told for a transient append failure.

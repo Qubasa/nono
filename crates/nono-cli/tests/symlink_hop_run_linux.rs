@@ -6,6 +6,10 @@
 use nono_test_support::{Argv, nono_test};
 use std::fs;
 
+fn cat() -> std::path::PathBuf {
+    nono_test_support::host_executable("cat").expect("cat on host")
+}
+
 /// `.gitconfig -> hosts/current/gitconfig -> hosts/mymac/gitconfig`, with
 /// `hosts/current -> hosts/mymac` a symlinked directory component.
 fn write_fixture(workspace: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -34,14 +38,15 @@ fn multi_hop_symlinked_leaf_resolves_through_symlinked_directory() {
     let profile = t.write_profile(
         "symlink-hop-positive-linux",
         &format!(
-            r#"{{"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"read":["{}"]}}}}"#,
-            gitconfig_link.display()
+            r#"{{{groups}"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"read":["{}"]}}}}"#,
+            gitconfig_link.display(),
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
     t.run()
         .profile(&profile)
-        .exec(Argv::new("/bin/cat").arg(&gitconfig_link))
+        .exec(Argv::new(cat()).arg(&gitconfig_link))
         .assert_stdout_contains("trusted");
 }
 
@@ -54,14 +59,15 @@ fn multi_hop_symlinked_leaf_does_not_widen_access_to_sibling_in_traversed_direct
     let profile = t.write_profile(
         "symlink-hop-negative-linux",
         &format!(
-            r#"{{"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"read":["{}"]}}}}"#,
-            gitconfig_link.display()
+            r#"{{{groups}"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"read":["{}"]}}}}"#,
+            gitconfig_link.display(),
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
     t.run()
         .profile(&profile)
-        .exec(Argv::new("/bin/cat").arg(&secret))
+        .exec(Argv::new(cat()).arg(&secret))
         .assert_failure(
             "granting a multi-hop symlink must not expose sibling files under the traversed directory",
         );

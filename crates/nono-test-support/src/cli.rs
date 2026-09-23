@@ -161,6 +161,15 @@ impl<'t, M: Sandboxing> Sandboxed<'t, M> {
         self
     }
 
+    /// `--read /nix/store` on hosts with a Nix store, the flag-only
+    /// counterpart of [`crate::nix_runtime_groups`].
+    pub fn nix_runtime(mut self) -> Self {
+        if Path::new("/nix/store").is_dir() {
+            self.inner.opt("--read", Path::new("/nix/store"));
+        }
+        self
+    }
+
     pub fn block_net(mut self) -> Self {
         self.inner.flag("--block-net");
         self

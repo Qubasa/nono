@@ -60,19 +60,6 @@ fn python3_bin() -> Option<String> {
     None
 }
 
-/// Profile fragment granting the interpreter's own runtime paths.
-///
-/// A Nix-store `python3` loads its stdlib and libc from `/nix/store`, which
-/// the default system paths do not cover; a distro interpreter under
-/// `/usr/bin` needs nothing extra.
-fn interpreter_groups(py: &str) -> &'static str {
-    if py.starts_with("/nix/store/") {
-        r#""groups":{"include":["nix_runtime"]},"#
-    } else {
-        ""
-    }
-}
-
 #[test]
 #[cfg(target_os = "linux")]
 fn af_unix_mediation_pathname_blocks_connect_to_unlisted_socket() {
@@ -90,7 +77,7 @@ fn af_unix_mediation_pathname_blocks_connect_to_unlisted_socket() {
         "af-unix-test",
         &format!(
             r#"{{{groups}"meta":{{"name":"af-unix-test"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}}}}"#,
-            groups = interpreter_groups(&py)
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
@@ -133,7 +120,7 @@ fn af_unix_mediation_pathname_allows_connect_to_listed_socket() {
         "af-unix-allow-test",
         &format!(
             r#"{{{groups}"meta":{{"name":"af-unix-allow-test"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}},"filesystem":{{"unix_socket":["{socket_arg}"]}}}}"#,
-            groups = interpreter_groups(&py)
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
@@ -171,7 +158,7 @@ fn filesystem_deny_blocks_unix_socket_connect_on_macos() {
         "macos-socket-deny",
         &format!(
             r#"{{{groups}"meta":{{"name":"macos-socket-deny"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"deny":["{socket_arg}"]}}}}"#,
-            groups = interpreter_groups(&py)
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
@@ -227,7 +214,7 @@ fn af_unix_mediation_pathname_allows_orphaned_child_tcp_connect() {
         "af-unix-orphan",
         &format!(
             r#"{{{groups}"meta":{{"name":"af-unix-orphan"}},"workdir":{{"access":"readwrite"}},"network":{{"block":false}},"linux":{{"af_unix_mediation":"pathname"}}}}"#,
-            groups = interpreter_groups(&py)
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
@@ -294,7 +281,7 @@ fn af_unix_mediation_pathname_allows_connect_burst_to_listed_socket() {
         "af-unix-burst",
         &format!(
             r#"{{{groups}"meta":{{"name":"af-unix-burst"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}},"filesystem":{{"unix_socket":["{socket_arg}"]}}}}"#,
-            groups = interpreter_groups(&py)
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
@@ -355,7 +342,7 @@ fn af_unix_mediation_pathname_allows_bind_in_granted_subtree() {
         "af-unix-subtree-bind",
         &format!(
             r#"{{{groups}"meta":{{"name":"af-unix-subtree-bind"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}},"filesystem":{{"unix_socket_subtree_bind":["{subtree_arg}"],"allow":["{no_grant_dir}"]}}}}"#,
-            groups = interpreter_groups(&py)
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
@@ -433,14 +420,14 @@ fn abstract_unix_sockets_are_scoped_to_the_sandbox_by_default() {
         "abstract-scoped",
         &format!(
             r#"{{{groups}"meta":{{"name":"abstract-scoped"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"off"}}}}"#,
-            groups = interpreter_groups(&py)
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
     let full_ipc = t.write_profile(
         "abstract-full-ipc",
         &format!(
             r#"{{{groups}"meta":{{"name":"abstract-full-ipc"}},"workdir":{{"access":"readwrite"}},"security":{{"ipc_mode":"full"}},"linux":{{"af_unix_mediation":"off"}}}}"#,
-            groups = interpreter_groups(&py)
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
@@ -518,7 +505,8 @@ fn proxy_only_without_af_unix_mediation_allows_af_unix_bind() {
     let profile = t.write_profile(
         "af-unix-proxy-only",
         &format!(
-            r#"{{"meta":{{"name":"af-unix-proxy-only"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"allow":["{sock_dir}"]}},"network":{{"allow_domain":["example.com"]}}}}"#
+            r#"{{{groups}"meta":{{"name":"af-unix-proxy-only"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"allow":["{sock_dir}"]}},"network":{{"allow_domain":["example.com"]}}}}"#,
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 

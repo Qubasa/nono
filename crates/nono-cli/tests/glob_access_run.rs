@@ -3,6 +3,11 @@
 
 use nono_test_support::{Argv, nono_test};
 use std::fs;
+use std::path::PathBuf;
+
+fn cat() -> PathBuf {
+    nono_test_support::host_executable("cat").expect("cat on host")
+}
 
 #[test]
 fn read_glob_grants_read_not_write() {
@@ -15,14 +20,15 @@ fn read_glob_grants_read_not_write() {
     let profile = t.write_profile(
         "glob-read-mode",
         &format!(
-            r#"{{"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"read":["{}/logs/*.log"]}}}}"#,
-            workspace.display()
+            r#"{{{groups}"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"read":["{}/logs/*.log"]}}}}"#,
+            workspace.display(),
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
     t.run()
         .profile(&profile)
-        .exec(Argv::new("/bin/cat").arg(&target))
+        .exec(Argv::new(cat()).arg(&target))
         .assert_stdout_contains("content");
 
     t.run()
@@ -46,8 +52,9 @@ fn write_glob_grants_write_not_read() {
     let profile = t.write_profile(
         "glob-write-mode",
         &format!(
-            r#"{{"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"write":["{}/out/*.txt"]}}}}"#,
-            workspace.display()
+            r#"{{{groups}"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"write":["{}/out/*.txt"]}}}}"#,
+            workspace.display(),
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
 
@@ -63,7 +70,7 @@ fn write_glob_grants_write_not_read() {
 
     t.run()
         .profile(&profile)
-        .exec(Argv::new("/bin/cat").arg(&target))
+        .exec(Argv::new(cat()).arg(&target))
         .assert_failure("write-only glob must not grant read");
 }
 
@@ -80,22 +87,24 @@ fn bypass_protection_glob_requires_paired_allow() {
     let no_allow = t.write_profile(
         "glob-bypass-no-allow",
         &format!(
-            r#"{{"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"deny":["{pattern}"],"bypass_protection":["{pattern}"]}}}}"#
+            r#"{{{groups}"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"deny":["{pattern}"],"bypass_protection":["{pattern}"]}}}}"#,
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
     t.run()
         .profile(&no_allow)
-        .exec(Argv::new("/bin/cat").arg(&target))
+        .exec(Argv::new(cat()).arg(&target))
         .assert_failure("bypass_protection without a paired allow must not grant access");
 
     let with_allow = t.write_profile(
         "glob-bypass-with-allow",
         &format!(
-            r#"{{"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"allow":["{pattern}"],"deny":["{pattern}"],"bypass_protection":["{pattern}"]}}}}"#
+            r#"{{{groups}"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"allow":["{pattern}"],"deny":["{pattern}"],"bypass_protection":["{pattern}"]}}}}"#,
+            groups = nono_test_support::nix_runtime_groups()
         ),
     );
     t.run()
         .profile(&with_allow)
-        .exec(Argv::new("/bin/cat").arg(&target))
+        .exec(Argv::new(cat()).arg(&target))
         .assert_stdout_contains("secret");
 }

@@ -11,7 +11,10 @@
 //!
 //! AF_UNIX mediation integration tests live in `socket_access_run.rs`.
 
-use nono_test_support::{Argv, Completed, NonoTest, Profile, Sandboxed, Sandboxing, nono_test};
+use nono_test_support::{
+    Argv, Completed, NonoTest, Profile, Sandboxed, Sandboxing, host_executable, nix_runtime_groups,
+    nono_test,
+};
 use std::fs;
 use std::net::TcpListener;
 #[cfg(target_os = "linux")]
@@ -27,16 +30,34 @@ fn python3_available() -> bool {
         .unwrap_or(false)
 }
 
+/// The host's `cat`, which NixOS does not ship at `/bin/cat`.
+fn cat() -> PathBuf {
+    host_executable("cat").expect("cat is on every supported host")
+}
+
+/// The `command_policies.commands` entry that turns the outer exec gate on.
+///
+/// Gates `sed` rather than a coreutils tool. Multi-call coreutils (Nix, uutils)
+/// is one inode for every applet, and the gate denies a gated inode under any
+/// name, so gating `cat` there would also deny the `mkdir`, `mv`, `env` and
+/// `printf` these tests run.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn gated_command() -> String {
+    let sed = host_executable("sed").expect("sed is on every supported host");
+    format!(r#""sed": {{ "executable": "{}" }}"#, sed.display())
+}
+
 /// A profile allowing only the test's workspace, with the network blocked.
 fn workspace_only_profile(t: &NonoTest, name: &str) -> Profile {
     t.write_profile(
         name,
         &format!(
-            r#"{{
+            r#"{{{groups}
                 "meta": {{ "name": "{name}-test" }},
                 "filesystem": {{ "allow": ["{workspace}"] }},
                 "network": {{ "block": true }}
             }}"#,
+            groups = nix_runtime_groups(),
             workspace = t.workspace().display()
         ),
     )
@@ -63,6 +84,7 @@ print('IO_URING', result, ctypes.get_errno())";
 
     t.run()
         .allow_cwd()
+        .nix_runtime()
         .block_net()
         .no_rollback()
         .exec(Argv::new("python3").arg("-c").arg(script))
@@ -90,7 +112,7 @@ fn direct_denies_path_outside_grant() {
     t.run()
         .profile(&profile)
         .no_rollback()
-        .exec(Argv::new("/bin/cat").arg("/etc/shadow"))
+        .exec(Argv::new(cat()).arg("/etc/shadow"))
         .assert_failure("/etc/shadow is outside the grant set")
         .assert_stdout_lacks("root:");
 }
@@ -112,7 +134,7 @@ fn direct_denies_path_outside_grant_macos() {
     t.run()
         .profile(&profile)
         .no_rollback()
-        .exec(Argv::new("/bin/cat").arg(&secret))
+        .exec(Argv::new(cat()).arg(&secret))
         .assert_failure("a path outside the grant set is denied")
         .assert_stdout_lacks("TOPSECRET");
 }
@@ -130,7 +152,7 @@ fn deny_outside_grant_produces_diagnostic_footer() {
     t.run()
         .profile(&profile)
         .no_rollback()
-        .exec(Argv::new("/bin/cat").arg(&target))
+        .exec(Argv::new(cat()).arg(&target))
         .assert_failure("a path outside the grant set is denied")
         .assert_stdout_lacks("forbidden-content");
 }
@@ -144,7 +166,7 @@ fn supervised_denies_path_outside_grant() {
     t.run()
         .profile(&profile)
         .no_rollback()
-        .exec(Argv::new("/bin/cat").arg("/etc/shadow"))
+        .exec(Argv::new(cat()).arg("/etc/shadow"))
         .assert_failure("/etc/shadow is outside the grant set")
         .assert_stdout_lacks("root:");
 }
@@ -162,7 +184,7 @@ fn granted_path_exits_zero() {
     t.run()
         .profile(&profile)
         .no_rollback()
-        .exec(Argv::new("/bin/cat").arg(&sentinel))
+        .exec(Argv::new(cat()).arg(&sentinel))
         .assert_success("a path inside the grant set is readable")
         .assert_stdout_contains("hello from nono test");
 }
@@ -211,7 +233,7 @@ fn env_credentials_with_command_policies_non_shim_entry_succeeds() {
     let profile = t.write_profile(
         "env-creds-cmd-policies",
         &format!(
-            r#"{{
+            r#"{{{groups}
                 "meta": {{ "name": "env-creds-cmd-policies-test" }},
                 "filesystem": {{ "allow": ["{workspace}"] }},
                 "network": {{ "block": true }},
@@ -219,13 +241,11 @@ fn env_credentials_with_command_policies_non_shim_entry_succeeds() {
                     "env://API_TOKEN": "API_TOKEN"
                 }},
                 "command_policies": {{
-                    "commands": {{
-                        "cat": {{
-                            "executable": "/bin/cat"
-                        }}
-                    }}
+                    "commands": {{ {gated} }}
                 }}
             }}"#,
+            groups = nix_runtime_groups(),
+            gated = gated_command(),
             workspace = t.workspace().display()
         ),
     );
@@ -260,11 +280,10 @@ fn command_policies_allows_script_exec_in_writable_grant_dir() {
         .assert_stdout_contains("ok");
 }
 
-/// Nix-style wrapper with a package-specific interpreter.
-#[test]
+/// A sealed `nix/store`-like directory holding a package-specific copy of
+/// `/bin/sh`, plus a profile that reads it with the outer exec gate active.
 #[cfg(target_os = "linux")]
-fn command_policies_allows_immutable_store_shebang_wrapper() {
-    let t = nono_test!("cmd-policies-store-wrapper");
+fn store_fixture(t: &NonoTest, name: &str) -> (PathBuf, PathBuf, Profile) {
     let store_dir = t.root().join("nix-store-like");
     fs::create_dir(&store_dir).expect("create immutable store fixture");
     fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o700))
@@ -275,12 +294,41 @@ fn command_policies_allows_immutable_store_shebang_wrapper() {
     fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o500))
         .expect("seal package-specific interpreter");
 
+    let profile = t.write_profile(
+        name,
+        &format!(
+            r#"{{{groups}
+                "meta": {{ "name": "{name}-test" }},
+                "filesystem": {{ "allow": ["{workspace}"], "read": ["{store_dir}"] }},
+                "network": {{ "block": true }},
+                "command_policies": {{
+                    "commands": {{ {gated} }}
+                }}
+            }}"#,
+            groups = nix_runtime_groups(),
+            gated = gated_command(),
+            workspace = t.workspace().display(),
+            store_dir = store_dir.display(),
+        ),
+    );
+    (store_dir, interpreter, profile)
+}
+
+/// Nix-style wrapper with a package-specific interpreter.
+#[test]
+#[cfg(target_os = "linux")]
+fn command_policies_allows_immutable_store_shebang_wrapper() {
+    let t = nono_test!("cmd-policies-store-wrapper");
+    let (store_dir, interpreter, profile) = store_fixture(&t, "cmd-policies-store-wrapper");
+
+    let printf = host_executable("printf").expect("printf is on every supported host");
     let wrapped = store_dir.join(".pi-wrapped");
     fs::write(
         &wrapped,
         format!(
-            "#!{}\nexec /usr/bin/printf 'wrapped ok\\n'\n",
-            interpreter.display()
+            "#!{}\nexec {} 'wrapped ok\\n'\n",
+            interpreter.display(),
+            printf.display(),
         ),
     )
     .expect("write wrapped executable");
@@ -294,24 +342,6 @@ fn command_policies_allows_immutable_store_shebang_wrapper() {
     )
     .expect("write wrapper");
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o500)).expect("seal wrapper");
-
-    let profile = t.write_profile(
-        "cmd-policies-store-wrapper",
-        &format!(
-            r#"{{
-                "meta": {{ "name": "cmd-policies-store-wrapper-test" }},
-                "filesystem": {{ "allow": ["{workspace}"], "read": ["{store_dir}"] }},
-                "network": {{ "block": true }},
-                "command_policies": {{
-                    "commands": {{
-                        "cat": {{ "executable": "/bin/cat" }}
-                    }}
-                }}
-            }}"#,
-            workspace = t.workspace().display(),
-            store_dir = store_dir.display(),
-        ),
-    );
 
     t.run()
         .profile(&profile)
@@ -389,18 +419,16 @@ fn command_policies_profile(t: &NonoTest, name: &str) -> Profile {
     t.write_profile(
         name,
         &format!(
-            r#"{{
+            r#"{{{groups}
                 "meta": {{ "name": "{name}-test" }},
                 "filesystem": {{ "allow": ["{workspace}"] }},
                 "network": {{ "block": true }},
                 "command_policies": {{
-                    "commands": {{
-                        "cat": {{
-                            "executable": "/bin/cat"
-                        }}
-                    }}
+                    "commands": {{ {gated} }}
                 }}
             }}"#,
+            groups = nix_runtime_groups(),
+            gated = gated_command(),
             workspace = t.workspace().display()
         ),
     )

@@ -1,6 +1,6 @@
 //! Integration tests for supervisor-side audit attestation.
 
-use nono_test_support::{KeyRef, NonoTest, Rollback, nono_test};
+use nono_test_support::{Argv, KeyRef, NonoTest, Rollback, nono_test};
 use serde_json::Value;
 use std::fs;
 
@@ -15,6 +15,10 @@ fn generate_file_signing_key(t: &NonoTest) -> KeyRef {
     assert!(key.private_key_path().exists(), "private key should exist");
     assert!(key.public_key_path().exists(), "public key should exist");
     key
+}
+
+fn pwd() -> Argv {
+    Argv::new(nono_test_support::host_executable("pwd").expect("pwd is on every supported host"))
 }
 
 fn only_audit_session_id(t: &NonoTest) -> String {
@@ -41,8 +45,9 @@ fn audit_verify_reports_signed_attestation_with_pinned_public_key() {
 
     t.run()
         .allow_cwd()
+        .nix_runtime()
         .audit_sign_key(&key)
-        .exec("/bin/pwd")
+        .exec(pwd())
         .assert_success("a signed session runs to completion");
 
     let session_id = only_audit_session_id(&t);
@@ -70,9 +75,10 @@ fn rollback_signed_session_verifies_from_audit_dir_bundle() {
 
     t.run()
         .allow_cwd()
+        .nix_runtime()
         .rollback(Rollback::new().no_prompt())
         .audit_sign_key(&key)
-        .exec("/bin/pwd")
+        .exec(pwd())
         .assert_success("a signed session with rollback runs to completion");
 
     let session_id = only_audit_session_id(&t);

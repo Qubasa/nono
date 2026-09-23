@@ -498,16 +498,6 @@ fn port_answers(port: u16) -> bool {
     }
 }
 
-/// A Nix-store-linked binary loads its interpreter and libc from `/nix/store`,
-/// which the default system paths do not cover.
-fn runtime_groups() -> &'static str {
-    if Path::new("/nix/store").is_dir() {
-        r#""groups":{"include":["nix_runtime"]},"#
-    } else {
-        ""
-    }
-}
-
 /// Everything the sandboxed child has to be able to exec: `nono` itself (the
 /// `ProxyCommand`), the real `ssh` the generated wrapper hands off to, the
 /// shell that resolves that wrapper, `python3` for the raw probes, and the
@@ -573,7 +563,7 @@ fn profile_json_with(linux: &str, network: &str) -> String {
             r#""workdir":{{"access":"readwrite"}},"#,
             r#""filesystem":{{"read":[{reads}]}},"network":{network}}}"#
         ),
-        groups = runtime_groups(),
+        groups = nono_test_support::nix_runtime_groups(),
         linux = linux,
         reads = read_paths().join(","),
         network = network,

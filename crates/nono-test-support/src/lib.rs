@@ -151,6 +151,72 @@ fn is_scrubbable(key: &OsStr) -> bool {
     name.starts_with("NONO_") || name.starts_with("XDG_")
 }
 
+/// Absolute path to the host's `name` executable, for tests that exec it directly.
+///
+/// `/usr/bin` and `/bin` come first, then `search_path` (a `PATH`-style list).
+/// NixOS ships neither `/usr/bin/python3` nor `/bin/echo`, so a hardcoded
+/// FHS path makes a test exit 127 there for reasons unrelated to what it
+/// checks. Symlinks are followed only while they keep the name: Nix coreutils
+/// is one binary that picks the tool from the name it runs under, so `cat`
+/// must not become `coreutils`. Following same-name links still leaves
+/// NixOS `envfs` behind, whose `/usr/bin/<name>` only resolves for a process
+/// with a matching `PATH`, which the sandboxed child may not have.
+pub fn find_executable(name: &str, search_path: &OsStr) -> Option<PathBuf> {
+    let mut dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
+    dirs.extend(std::env::split_paths(search_path));
+    for dir in dirs {
+        let Ok(dir) = fs::canonicalize(&dir) else {
+            continue;
+        };
+        let candidate = dir.join(name);
+        if is_executable(&candidate) {
+            return Some(follow_same_name_links(candidate));
+        }
+    }
+    None
+}
+
+fn follow_same_name_links(mut path: PathBuf) -> PathBuf {
+    // Bounded like the kernel's own symlink limit.
+    for _ in 0..40 {
+        let Ok(target) = fs::read_link(&path) else {
+            break;
+        };
+        let Some(dir) = path.parent() else {
+            break;
+        };
+        let target = dir.join(target);
+        if target.file_name() != path.file_name() {
+            break;
+        }
+        path = target;
+    }
+    path
+}
+
+/// [`find_executable`] over this process's `PATH`.
+pub fn host_executable(name: &str) -> Option<PathBuf> {
+    find_executable(name, &std::env::var_os("PATH").unwrap_or_default())
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Profile fragment including the `nix_runtime` group on hosts with a Nix store.
+///
+/// A Nix-store binary loads its interpreter and libc from `/nix/store`, which
+/// the default system paths do not cover. It ends in a comma, so it goes first
+/// in a profile object: `format!(r#"{{{}"meta":...}}"#, nix_runtime_groups())`.
+pub fn nix_runtime_groups() -> &'static str {
+    if Path::new("/nix/store").is_dir() {
+        r#""groups":{"include":["nix_runtime"]},"#
+    } else {
+        ""
+    }
+}
+
 /// Constructs a [`NonoTest`] from the calling crate's compile-time environment.
 ///
 /// `CARGO_BIN_EXE_nono` is defined only while compiling test targets of the

@@ -1415,7 +1415,7 @@ mod intercept_tests {
             std::fs::write(
                 &script,
                 format!(
-                    "#!/bin/sh\n/usr/bin/touch {}\necho {}\nexit 0\n",
+                    "#!/bin/sh\n: > {}\necho {}\nexit 0\n",
                     marker.display(),
                     output
                 ),

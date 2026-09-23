@@ -2,9 +2,27 @@ use super::*;
 use crate::exec_strategy::{SeccompPolicy, SupervisorConfig, ThreadingContext, supervisor_linux};
 use nono::{AccessMode, FsCapability};
 use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+
+/// `PATH` of the test runner. `isolated` hands it to every child because the
+/// tool gate test runs its child with an empty `PATH`.
+const HOST_PATH_ENV: &str = "NONO_CLONE_TEST_PATH";
+
+static PYTHON3: LazyLock<PathBuf> = LazyLock::new(|| {
+    host_binary("python3").expect("python3 on /usr/bin, /bin or the test runner's PATH")
+});
+
+fn host_binary(name: &str) -> Result<PathBuf> {
+    let search_path = std::env::var_os(HOST_PATH_ENV)
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    nono_test_support::find_executable(name, &search_path)
+        .ok_or_else(|| failure("host executable not found"))
+}
 
 fn isolated(name: &str, test: impl FnOnce() -> Result<()>) -> Result<()> {
     if std::env::var("NONO_CLONE_TEST").ok().as_deref() == Some(name) {
@@ -26,6 +44,7 @@ fn isolated(name: &str, test: impl FnOnce() -> Result<()>) -> Result<()> {
             "--test-threads=1",
         ])
         .env("NONO_CLONE_TEST", name)
+        .env(HOST_PATH_ENV, std::env::var_os("PATH").unwrap_or_default())
         .spawn()
         .map_err(NonoError::Io)?;
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -46,7 +65,7 @@ fn isolated(name: &str, test: impl FnOnce() -> Result<()>) -> Result<()> {
 fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_> {
     ExecConfig {
         command: &[],
-        resolved_program: Path::new("/usr/bin/python3"),
+        resolved_program: PYTHON3.as_path(),
         caps,
         env_vars: vec![],
         cap_file: Path::new("/unused"),
@@ -81,7 +100,14 @@ fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_>
 
 fn capabilities(port: u16, bind: u16) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new().proxy_only_with_bind(port, vec![bind]);
-    for directory in ["/usr", "/lib", "/lib64", "/etc", "/proc/self/fd"] {
+    for directory in [
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/etc",
+        "/nix/store",
+        "/proc/self/fd",
+    ] {
         if Path::new(directory).exists() {
             caps.add_fs(FsCapability::new_dir(directory, AccessMode::Read)?);
         }
@@ -205,7 +231,8 @@ fn run(
     pty: Option<RawFd>,
     resource: Option<RawFd>,
 ) -> Result<Bootstrap> {
-    let program = CString::new("/usr/bin/python3").map_err(|_| failure("program CString"))?;
+    let program =
+        CString::new(PYTHON3.as_os_str().as_bytes()).map_err(|_| failure("program CString"))?;
     let arg = CString::new("-c").map_err(|_| failure("argument CString"))?;
     let script = CString::new(script).map_err(|_| failure("script CString"))?;
     let argv = [
@@ -774,11 +801,7 @@ fn full_cli_supervisor_combined_path() -> Result<()> {
         let script = format!(
             "import socket\nsocket.create_connection(('127.0.0.1',{port})).close()\ntry: socket.create_connection(('127.0.0.1',{denied}))\nexcept PermissionError: pass\nelse: raise AssertionError('direct TCP escaped')\n"
         );
-        let argv = vec![
-            std::ffi::OsString::from("/usr/bin/python3"),
-            "-c".into(),
-            script.into(),
-        ];
+        let argv = vec![PYTHON3.as_os_str().to_owned(), "-c".into(), script.into()];
         config.command = &argv;
         // The Rust test runner itself has a worker thread; the CLI's normal
         // known-thread budget already covers this context.
@@ -831,9 +854,10 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
         let directory = tempfile::tempdir().map_err(NonoError::Io)?;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .map_err(NonoError::Io)?;
-        std::os::unix::fs::symlink("/usr/bin/python3", directory.path().join("python3"))
+        let true_bin = host_binary("true")?;
+        std::os::unix::fs::symlink(PYTHON3.as_path(), directory.path().join("python3"))
             .map_err(NonoError::Io)?;
-        std::os::unix::fs::symlink("/usr/bin/true", directory.path().join("true"))
+        std::os::unix::fs::symlink(&true_bin, directory.path().join("true"))
             .map_err(NonoError::Io)?;
         let mut policy = crate::command_policy::CommandPoliciesConfig {
             executable_dirs: vec![directory.path().to_string_lossy().into_owned()],
@@ -842,7 +866,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
         policy.commands.insert(
             "true".into(),
             crate::command_policy::CommandPolicyConfig {
-                executable: Some("/usr/bin/true".into()),
+                executable: Some(true_bin.to_string_lossy().into_owned()),
                 ..Default::default()
             },
         );
@@ -850,7 +874,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: &policy,
-                initial_program: Path::new("/usr/bin/python3"),
+                initial_program: PYTHON3.as_path(),
                 resolved_command_binaries: None,
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
                     None,
@@ -871,7 +895,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
             let mut config = config(&caps, true, true);
             config.tool_sandbox_runtime = Some(&runtime);
             let script = format!(
-                "import os, socket\ntry: os.execv('/usr/bin/true', ['true'])\nexcept PermissionError: pass\nelse: raise AssertionError('tool execution gate escaped')\nsocket.create_connection(('127.0.0.1',{port})).close()\n"
+                "import os, socket\ntry: os.execv({true_bin:?}, ['true'])\nexcept PermissionError: pass\nelse: raise AssertionError('tool execution gate escaped')\nsocket.create_connection(('127.0.0.1',{port})).close()\n"
             );
             let bootstrap = run(
                 &config,

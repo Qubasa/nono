@@ -27,11 +27,12 @@ fn rollback_restores_file_after_write() {
     let profile = t.write_profile(
         "rollback-restore",
         &format!(
-            r#"{{
+            r#"{{{groups}
                 "meta": {{ "name": "rollback-restore-test" }},
                 "filesystem": {{ "allow": ["{workspace}", "{rollback_dest}"] }},
                 "network": {{ "block": true }}
             }}"#,
+            groups = nono_test_support::nix_runtime_groups(),
             workspace = workspace.display(),
             rollback_dest = rollback_dest.display(),
         ),
@@ -83,11 +84,12 @@ fn dry_run_does_not_modify_workspace() {
     let profile = t.write_profile(
         "rollback-dry",
         &format!(
-            r#"{{
+            r#"{{{groups}
                 "meta": {{ "name": "rollback-dry-test" }},
                 "filesystem": {{ "allow": ["{workspace}", "{rollback_dest}"] }},
                 "network": {{ "block": true }}
             }}"#,
+            groups = nono_test_support::nix_runtime_groups(),
             workspace = workspace.display(),
             rollback_dest = rollback_dest.display(),
         ),

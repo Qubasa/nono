@@ -196,7 +196,15 @@
         in
         {
           default = pkgs.mkShell {
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.clippy
+              pkgs.rustfmt
+              # Tests exec python3 under the tool gate, which only admits the
+              # binary it resolved. A withPackages interpreter from the user's
+              # PATH is a wrapper that re-execs the real one and gets denied.
+              pkgs.python3
+            ];
             buildInputs = [
               pkgs.dbus
               pkgs.rustc

@@ -219,7 +219,7 @@ mod tests {
         let trojan = writable_dir.join(OPENER);
         std::fs::write(
             &trojan,
-            format!("#!/bin/sh\n/usr/bin/touch {}\nexit 0\n", marker.display()),
+            format!("#!/bin/sh\n: > {}\nexit 0\n", marker.display()),
         )
         .expect("write trojan");
         let mut perms = std::fs::metadata(&trojan).expect("meta").permissions();
@@ -235,10 +235,7 @@ mod tests {
         let real_bin = real_dir.join(OPENER);
         std::fs::write(
             &real_bin,
-            format!(
-                "#!/bin/sh\n/usr/bin/touch {}\nexit 0\n",
-                real_marker.display()
-            ),
+            format!("#!/bin/sh\n: > {}\nexit 0\n", real_marker.display()),
         )
         .expect("write real bin");
         let mut perms = std::fs::metadata(&real_bin).expect("meta").permissions();

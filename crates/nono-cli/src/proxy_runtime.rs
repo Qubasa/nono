@@ -4604,7 +4604,7 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "github".to_string(),
-            test_capture_entry(vec!["/bin/echo".to_string(), "ghp_test".to_string()]),
+            test_capture_entry(echo_command(&["ghp_test"])),
         );
         let backend = ProxyCredentialCaptureBackend::new(
             &entries,
@@ -4713,7 +4713,7 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "empty".to_string(),
-            test_capture_entry_no_cache(vec!["/bin/echo".to_string()]),
+            test_capture_entry_no_cache(echo_command(&[])),
         );
         let backend = ProxyCredentialCaptureBackend::new(
             &entries,
@@ -4784,7 +4784,7 @@ mod tests {
 
     #[test]
     fn proxy_credential_capture_backend_uses_path_cache_scope() -> Result<()> {
-        let mut entry = test_capture_entry(vec!["/bin/echo".to_string(), "scoped".to_string()]);
+        let mut entry = test_capture_entry(echo_command(&["scoped"]));
         entry.cache_path_regex = Some("^/(?:repos/|orgs/)?([^/]+)".to_string());
         let mut entries = HashMap::new();
         entries.insert("github".to_string(), entry);
@@ -4817,10 +4817,9 @@ mod tests {
 
     #[test]
     fn proxy_credential_capture_backend_parses_json_headers() -> Result<()> {
-        let mut entry = test_capture_entry_no_cache(vec![
-            "/bin/echo".to_string(),
-            r#"{"headers":{"Authorization":"Bearer one","X-Gateway-Key":"two"}}"#.to_string(),
-        ]);
+        let mut entry = test_capture_entry_no_cache(echo_command(&[
+            r#"{"headers":{"Authorization":"Bearer one","X-Gateway-Key":"two"}}"#,
+        ]));
         entry.output = crate::profile::CredentialCaptureOutput::Config(
             crate::profile::CredentialCaptureOutputConfig {
                 format: crate::profile::CredentialCaptureOutputFormat::Json,
@@ -4875,7 +4874,7 @@ mod tests {
             command: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                r#"/bin/cat > "$1"; printf '%s' '{"material":{"type":"secret","value":"provider-token"}}'"#
+                r#"cat > "$1"; printf '%s' '{"material":{"type":"secret","value":"provider-token"}}'"#
                     .to_string(),
                 "provider".to_string(),
                 stdin_path.to_string_lossy().into_owned(),
@@ -4986,7 +4985,11 @@ mod tests {
 
     #[test]
     fn proxy_credential_capture_backend_sends_request_json_stdin() -> Result<()> {
-        let mut entry = test_capture_entry_no_cache(vec!["/bin/cat".to_string()]);
+        let mut entry = test_capture_entry_no_cache(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "cat".to_string(),
+        ]);
         entry.stdin = crate::profile::CredentialCaptureStdinMode::RequestJson;
         entry.cache_path_regex = Some("^/orgs/([^/]+)".to_string());
         let mut entries = HashMap::new();
@@ -5270,7 +5273,7 @@ mod tests {
             std::fs::write(
                 &script,
                 format!(
-                    "#!/bin/sh\n/usr/bin/touch {}\necho {}\nexit 0\n",
+                    "#!/bin/sh\n: > {}\necho {}\nexit 0\n",
                     marker.display(),
                     output
                 ),
@@ -5512,6 +5515,28 @@ mod tests {
         let mut entry = test_capture_entry(command);
         entry.ttl_secs = Some(0);
         entry
+    }
+
+    /// `/bin/echo` for hosts that lack it: NixOS has `/bin/sh` and nothing else in `/bin`.
+    fn echo_command(args: &[&str]) -> Vec<String> {
+        let mut command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            r#"echo "$@""#.to_string(),
+            "sh".to_string(),
+        ];
+        command.extend(args.iter().map(|arg| (*arg).to_string()));
+        command
+    }
+
+    fn python3() -> Result<String> {
+        // Sibling tests point PATH at trojan directories while holding ENV_LOCK.
+        let _guard = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        nono_test_support::host_executable("python3")
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or_else(|| NonoError::SandboxInit("no python3 on /usr/bin, /bin or PATH".into()))
     }
 
     fn assert_capture_secret(
@@ -5838,7 +5863,7 @@ mod tests {
 
         let result = (|| -> Result<()> {
             let mut entry = test_capture_entry_no_cache(vec![
-                "/usr/bin/python3".to_string(),
+                python3()?,
                 "-c".to_string(),
                 // select() with timeout=0: /dev/null stdin is immediately readable (EOF);
                 // a blocking pipe (write end open, no data) is not ready.
@@ -5922,7 +5947,7 @@ mod tests {
 
         let result = (|| -> Result<()> {
             let mut entry = test_capture_entry_no_cache(vec![
-                "/usr/bin/python3".to_string(),
+                python3()?,
                 "-c".to_string(),
                 concat!(
                     "import select, sys; ",
