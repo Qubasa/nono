@@ -185,6 +185,28 @@ The policy lives in the profile, not in the prompt. The agent can ask for a tool
 
 Read more in [Sandboxed Tool Execution](https://nono.sh/docs/cli/features/tool-sandbox).
 
+## Known limit: SSH tunnels through an allowed session
+
+`--allow-ssh qubasa@build.example.com` lets the sandbox log in to that host as `qubasa`, and only as `qubasa`: a sandboxed `ssh root@build.example.com` is refused by nono. nono enforces this for the SSH connection it mediates. It cannot see inside that connection, so a sandboxed process can build a second, unmediated SSH session through the first one:
+
+```sh
+# inside the sandbox, with only qubasa@build.example.com allowed
+ssh -o 'ProxyCommand ssh qubasa@build.example.com nc 127.0.0.1 22' \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o PubkeyAuthentication=yes -o IdentityAgent="$SSH_AUTH_SOCK" \
+    root@127.0.0.1 id
+```
+
+The outer `ssh` is an allowed login as `qubasa` running an ordinary command, `nc`, which nono permits on an endpoint without a command list. On the remote host `nc` connects back to the local sshd, and the inner `ssh` speaks SSH straight to it. nono relays the bytes without seeing the name `root`, so none of its SSH rules apply to the inner session: not the user check and not the refusal of `-L`, `-A` or `-J`. Any tool that opens a socket on the remote host does the same job: `socat`, `python`, or `bash`'s `/dev/tcp`.
+
+The inner login still has to authenticate. The sandbox cannot read `~/.ssh`, but with `linux.af_unix_mediation` left at its default (`off`) in proxy-only mode it **can** connect to the host's ssh-agent at `$SSH_AUTH_SOCK`. If that agent holds a key that another account on the host accepts, such as `root`, the inner login succeeds as that account. Without any usable key the same tunnel still reaches every other host and port that the remote host can reach, for example `ssh qubasa@build.example.com nc example.com 443`.
+
+To close it:
+
+- Give endpoints an agent should not have a shell on a `commands` list. An endpoint limited to `git-upload-pack /srv/repo.git` cannot run `nc`. Avoid interpreters such as `sh` or `python3` in the list, since they read a script from stdin.
+- Set `"linux": {"af_unix_mediation": "pathname"}` so the sandbox cannot reach your ssh-agent.
+- Restrict the key on the remote host with `restrict,command="…"` in `authorized_keys`. The remote host is the only place a login can be limited in a way nothing inside the session can undo.
+
 ## Ready to go deep?
 
 Head over to the [docs](https://nono.sh/docs) and discover nono's rich composable policy system, credentials injection, L7 filtering, supply chain security, rollback, multiplexing, audit and more.

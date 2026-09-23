@@ -214,7 +214,7 @@ Across profile inheritance, `allow_ssh` merges like `allow_domain` rather than b
 
 nono authorizes every channel and every channel request on its own. A `session` channel is relayed, and inside it `shell`, `exec`, `pty-req`, `window-change`, `subsystem` and `signal` run on the remote host. An `env` request is the one ordinary thing that does not travel: the variable is dropped rather than forwarded, so `SendEnv` sets nothing on the remote side and a remote `$LANG` stays at whatever the server's own default is. `TERM` is unaffected, because it travels inside `pty-req`.
 
-Everything that would turn the session into a transport is refused, and the refusal names the request type:
+Every SSH forwarding request is refused, and the refusal names the request type. This does not stop a remote command from acting as a transport: on an endpoint without a command list, `ssh host nc other 22` pipes a raw connection through the allowed session, and a second SSH login inside it is outside nono's view. Use a command list, `linux.af_unix_mediation: "pathname"`, and `authorized_keys` restrictions on the remote host to close that; see the README section "Known limit: SSH tunnels through an allowed session".
 
 | Refused | Wire name | Asked for by |
 |---------|-----------|--------------|
