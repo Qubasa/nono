@@ -748,10 +748,14 @@ pub(super) fn network_notification_out_of_scope(policy: SeccompPolicy, family: u
 ///    supervisor canonicalizes that path and checks it against explicit
 ///    [`UnixSocketCapability`] grants.
 ///
-///    **Abstract and unnamed `AF_UNIX` are denied** in that mode. The
+///    **Abstract `AF_UNIX` may bind but not reach out** in that mode. The
 ///    abstract namespace (`sun_path[0] == '\0'`) lives outside the
-///    filesystem, so pathname capabilities cannot mediate it. Unnamed sockets
-///    (addrlen == 2) have no path to check.
+///    filesystem, so pathname capabilities cannot mediate it. `bind()` only
+///    claims a name and reaches no one, and runtimes use exactly that as a
+///    crash-safe process lock (omp's file locks bind a datagram socket and
+///    read `EADDRINUSE` as "held"). `connect()` and the send family are what
+///    reach another process's socket, so they stay denied. Unnamed sockets
+///    (addrlen == 2) have no name to check and are denied.
 ///
 /// 2. For `AF_INET`/`AF_INET6` in proxy-only mode:
 ///    - `connect()` is allowed only to `127.0.0.1:proxy_port` (the nono proxy).
@@ -780,12 +784,17 @@ pub(super) fn decide_network_notification(
     }
 
     // AF_UNIX with mediation enabled: allow only filesystem-backed (pathname)
-    // sockets that match an explicit socket capability. Abstract/unnamed
-    // sockets bypass pathname mediation, so deny them.
+    // sockets that match an explicit socket capability, plus abstract bind.
+    // Abstract connect/send and unnamed sockets bypass pathname mediation, so
+    // deny them.
     if sockaddr.family == libc::AF_UNIX as u16 {
         match sockaddr.unix_kind {
             Some(UnixSocketKind::Pathname) => {
                 return decide_af_unix_pathname(child_pid, syscall, sockaddr, config);
+            }
+            Some(UnixSocketKind::Abstract) if syscall == SYS_BIND => {
+                debug!("Proxy seccomp: allowing AF_UNIX abstract-namespace bind");
+                return NetworkDecision::Allow;
             }
             Some(UnixSocketKind::Abstract) => {
                 debug!(
@@ -2156,25 +2165,40 @@ mod tests {
 
         /// Scope-limit test: with AF_UNIX mediation enabled, abstract-namespace
         /// AF_UNIX (`sun_path[0] == 0`) is not covered by pathname socket
-        /// capabilities, so it stays denied.
+        /// capabilities, so every syscall that reaches another socket through
+        /// it stays denied.
         #[test]
-        fn af_unix_abstract_is_denied() {
+        fn af_unix_abstract_connect_and_send_are_denied() {
             let backend = DenyAllBackend;
             let config = make_config(&backend, 0, Vec::new(), &[]);
-            assert_eq!(
-                decide_network_notification(test_pid(), SYS_BIND, &unix_abstract(), &config),
-                NetworkDecision::Deny,
-                "abstract AF_UNIX must be denied because pathname grants do not cover it"
-            );
-            assert_eq!(
-                decide_network_notification(test_pid(), SYS_CONNECT, &unix_abstract(), &config),
-                NetworkDecision::Deny,
-            );
+            for syscall in [SYS_CONNECT, SYS_SENDTO, SYS_SENDMSG, SYS_SENDMMSG] {
+                assert_eq!(
+                    decide_network_notification(test_pid(), syscall, &unix_abstract(), &config),
+                    NetworkDecision::Deny,
+                    "abstract AF_UNIX syscall {syscall} must be denied"
+                );
+            }
+        }
+
+        /// Abstract `bind` reaches no one, and runtimes take process-owned
+        /// locks with it (omp's `@omp-file-lock-*`), so it passes in both
+        /// modes that mediate AF_UNIX.
+        #[test]
+        fn af_unix_abstract_bind_is_allowed() {
+            let backend = DenyAllBackend;
+            for config in [
+                make_config(&backend, 8080, Vec::new(), &[]),
+                make_af_unix_only_config(&backend, &[]),
+            ] {
+                assert_eq!(
+                    decide_network_notification(test_pid(), SYS_BIND, &unix_abstract(), &config),
+                    NetworkDecision::Allow,
+                );
+            }
         }
 
         /// With AF_UNIX mediation enabled, unnamed AF_UNIX (`addrlen == 2`)
-        /// has no path to check, so fail closed — consistent with abstract
-        /// handling.
+        /// has no name to check, so fail closed.
         #[test]
         fn af_unix_unnamed_is_denied() {
             let backend = DenyAllBackend;
@@ -2497,18 +2521,6 @@ mod tests {
                 ),
                 NetworkDecision::Deny,
                 "pathname AF_UNIX sendmmsg without grant must be denied"
-            );
-        }
-
-        /// Abstract AF_UNIX `sendto` is denied (same as connect).
-        #[test]
-        fn af_unix_abstract_sendto_is_denied() {
-            let backend = DenyAllBackend;
-            let config = make_config(&backend, 0, Vec::new(), &[]);
-            assert_eq!(
-                decide_network_notification(test_pid(), SYS_SENDTO, &unix_abstract(), &config),
-                NetworkDecision::Deny,
-                "abstract AF_UNIX sendto must be denied"
             );
         }
 

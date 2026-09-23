@@ -164,8 +164,13 @@ imply permission to talk to every socket under those paths.
 No capability can grant the abstract namespace. Abstract addresses
 (`sun_path[0] == '\0'`) and unnamed AF_UNIX addresses carry no filesystem path,
 so `filesystem.unix_socket*` cannot describe them. Under `pathname` mediation
-both are denied with `EACCES` and reported as IPC denials naming the socket
-kind. With mediation off, their containment is `security.ipc_mode` scoping
+abstract `connect(2)` and the `send*` family, and every unnamed address, are
+denied with `EACCES` and reported as IPC denials naming the socket kind.
+Abstract `bind(2)` passes: it claims a name without reaching any other socket,
+and runtimes use it as a crash-safe process lock (omp holds its file locks as
+bound `@omp-file-lock-*` datagram sockets). A sandbox that shares the host
+network namespace can therefore claim an abstract name before a host service
+does. With mediation off, abstract containment is `security.ipc_mode` scoping
 above: the default `shared_memory_only` keeps abstract sockets created outside
 the sandbox unreachable on V6 kernels, and `ipc_mode: "full"` is the explicit
 opt-out. On kernels whose Landlock ABI predates abstract socket scoping, the
