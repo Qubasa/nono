@@ -3217,16 +3217,18 @@ fn add_outer_exec_file_with_deps(
     if !script_seen.insert(script_id) {
         return Ok(());
     }
-    let interpreter = shape.interpreter.ok_or_else(|| {
+    let shebang_interpreter = shape.interpreter.ok_or_else(|| {
         NonoError::SandboxInit(format!(
             "tool-sandbox script {} has no resolved shebang interpreter",
             path.display()
         ))
     })?;
-    let interpreter = trusted_outer_exec_interpreter(&interpreter, outer_caps)?;
+    let interpreter = trusted_outer_exec_interpreter(&shebang_interpreter, outer_caps)?;
 
-    // `env` re-execs its target; grant that file, never a broad PATH.
-    let target = env_shebang_target_interpreter(&interpreter, &shape.interpreter_args)
+    // `env` re-execs its target; grant that file, never a broad PATH. `env` is
+    // recognized by its shebang name because multi-call coreutils (Nix, uutils)
+    // canonicalizes it to `coreutils`.
+    let target = env_shebang_target_interpreter(&shebang_interpreter, &shape.interpreter_args)
         .map(|target| trusted_outer_exec_interpreter(&target, outer_caps))
         .transpose()?;
     let wrapper_target = wrapper_exec_target(path)?
@@ -3843,14 +3845,14 @@ fn add_executable_shape_baseline(
     if binary.shape.kind != ResolvedExecutableKind::ShebangScript {
         return Ok(());
     }
-    let Some(interpreter) = binary.shape.interpreter.as_ref() else {
+    let Some(shebang_interpreter) = binary.shape.interpreter.as_ref() else {
         return Ok(());
     };
     let interpreter =
-        interpreter
+        shebang_interpreter
             .canonicalize()
             .map_err(|source| NonoError::PathCanonicalization {
-                path: interpreter.clone(),
+                path: shebang_interpreter.clone(),
                 source,
             })?;
     caps.add_fs(FsCapability::new_file(&interpreter, AccessMode::Read)?);
@@ -3858,7 +3860,7 @@ fn add_executable_shape_baseline(
     // Landlock intersects the filesystem and execute layers, so the re-exec'd
     // `<interp>` (and its ELF closure) must be present in the fs layer too.
     if let Some(real_interp) =
-        env_shebang_target_interpreter(&interpreter, &binary.shape.interpreter_args)
+        env_shebang_target_interpreter(shebang_interpreter, &binary.shape.interpreter_args)
         && let Ok(canonical_real) = real_interp.canonicalize()
     {
         caps.add_fs(FsCapability::new_file(&canonical_real, AccessMode::Read)?);
@@ -7603,6 +7605,63 @@ mod tests {
         assert!(
             paths.contains(&target),
             "outer gate must permit env's re-exec target: {paths:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outer_exec_gate_follows_env_shebang_through_a_multicall_binary() -> Result<()> {
+        // Nix and uutils ship `env` as a symlink to a single `coreutils` binary.
+        let _env = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(real_env) = Path::new("/usr/bin/env").canonicalize() else {
+            return Ok(());
+        };
+        let Some(target) = env_shebang_target_interpreter(Path::new("env"), &["sh".to_string()])
+        else {
+            return Ok(());
+        };
+        let tmp = test_tempdir()?;
+        let multicall = tmp.path().join("coreutils");
+        fs::copy(&real_env, &multicall).map_err(|source| NonoError::ConfigWrite {
+            path: multicall.clone(),
+            source,
+        })?;
+        let env = tmp.path().join("env");
+        std::os::unix::fs::symlink(&multicall, &env).map_err(|source| NonoError::ConfigWrite {
+            path: env.clone(),
+            source,
+        })?;
+        let script = tmp.path().join("env-wrapped-tool");
+        fs::write(&script, format!("#!{} sh\nexit 0\n", env.display())).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: script.clone(),
+                source,
+            }
+        })?;
+
+        reset_elf_resolution_cache();
+        let mut seen = HashSet::new();
+        let mut script_seen = HashSet::new();
+        let mut paths = Vec::new();
+        add_outer_exec_file_with_deps(
+            &script,
+            &CapabilitySet::new(),
+            &mut seen,
+            &mut script_seen,
+            &mut paths,
+        )?;
+
+        let target = target
+            .canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: target,
+                source,
+            })?;
+        assert!(
+            paths.contains(&target),
+            "a multi-call env must still grant its re-exec target: {paths:?}"
         );
         Ok(())
     }

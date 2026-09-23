@@ -3279,14 +3279,14 @@ fn add_executable_shape_baseline(
     caps: &mut CapabilitySet,
     binary: &ResolvedCommandBinary,
 ) -> Result<()> {
-    let Some(interpreter) = binary.shape.interpreter.as_ref() else {
+    let Some(shebang_interpreter) = binary.shape.interpreter.as_ref() else {
         return Ok(());
     };
     let interpreter =
-        interpreter
+        shebang_interpreter
             .canonicalize()
             .map_err(|source| NonoError::PathCanonicalization {
-                path: interpreter.clone(),
+                path: shebang_interpreter.clone(),
                 source,
             })?;
     if let Some(bundle) = python_framework_app_bundle_path(&interpreter)
@@ -3297,7 +3297,7 @@ fn add_executable_shape_baseline(
     caps.add_fs(FsCapability::new_file(&interpreter, AccessMode::Read)?);
     // `env` re-exec's the real interpreter, so grant it read too (as on Linux).
     if let Some(real_interp) =
-        env_shebang_target_interpreter(&interpreter, &binary.shape.interpreter_args)
+        env_shebang_target_interpreter(shebang_interpreter, &binary.shape.interpreter_args)
         && let Ok(canonical_real) = real_interp.canonicalize()
     {
         if let Some(bundle) = python_framework_app_bundle_path(&canonical_real)
