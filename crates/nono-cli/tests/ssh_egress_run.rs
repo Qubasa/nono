@@ -1489,7 +1489,7 @@ fn an_interactive_pty_reports_a_terminal_size() {
 
 /// `stty size` prints exactly two integers, and under a pty the line ends CRLF.
 fn is_terminal_size(line: &str) -> bool {
-    let mut fields = line.trim().split_whitespace();
+    let mut fields = line.split_whitespace();
     let rows = fields.next().and_then(|f| f.parse::<u32>().ok());
     let columns = fields.next().and_then(|f| f.parse::<u32>().ok());
     matches!((rows, columns, fields.next()), (Some(_), Some(_), None))

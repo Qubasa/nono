@@ -365,16 +365,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             _ => None,
         })
         .collect();
-    let cap_file = write_capability_state_file(
+    let state = sandbox_state::SandboxState::from_caps_with_denies(
         &caps,
         &flags.bypass_protection_paths,
         &deny_paths,
         &allowed_domain_strs,
         &denied_domain_strs,
-        &ssh_endpoint_strs,
         &domain_endpoints,
-        flags.silent,
-    );
+    )
+    .with_ssh_endpoints(&ssh_endpoint_strs);
+    let cap_file = write_capability_state_file(&state, flags.silent);
     let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
     if cap_file_path != Path::new("/dev/null") {
         caps.add_fs(FsCapability::new_file(&cap_file_path, AccessMode::Read)?);
@@ -894,25 +894,9 @@ fn validate_command_policy_execution_support() -> Result<()> {
 }
 
 fn write_capability_state_file(
-    caps: &CapabilitySet,
-    bypass_protection_paths: &[std::path::PathBuf],
-    deny_paths: &[std::path::PathBuf],
-    allowed_domains: &[String],
-    denied_domains: &[String],
-    ssh_endpoints: &[String],
-    domain_endpoints: &[sandbox_state::DomainEndpointState],
+    state: &sandbox_state::SandboxState,
     silent: bool,
 ) -> Option<std::path::PathBuf> {
-    let state = sandbox_state::SandboxState::from_caps_with_denies(
-        caps,
-        bypass_protection_paths,
-        deny_paths,
-        allowed_domains,
-        denied_domains,
-        domain_endpoints,
-    )
-    .with_ssh_endpoints(ssh_endpoints);
-
     for _ in 0..8 {
         let cap_file = next_capability_state_file_path();
         match state.write_to_file(&cap_file) {

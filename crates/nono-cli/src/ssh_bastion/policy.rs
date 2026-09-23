@@ -48,6 +48,10 @@ pub(crate) enum ChannelRequest<'a> {
 
 /// A request made on the connection rather than on a channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variants mirror the SSH wire names and russh handler methods, all of which end in forward"
+)]
 pub(crate) enum GlobalRequest {
     TcpipForward,
     CancelTcpipForward,
