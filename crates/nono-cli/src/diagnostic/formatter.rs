@@ -4144,6 +4144,9 @@ mod tests {
 
     #[test]
     fn test_supervised_consolidated_list_truncates_beyond_cap() {
+        // The suggested /tmp target is dropped while a sibling test points HOME,
+        // and so the protected state root, into a tempdir under /tmp.
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
         // Zero-pad the index so paths sort in numeric order.
         let caps = make_test_caps();
         let denials: Vec<DenialRecord> = (0..15)
@@ -4191,6 +4194,8 @@ mod tests {
 
     #[test]
     fn test_supervised_rate_limited_denial() {
+        // See test_supervised_consolidated_list_truncates_beyond_cap.
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
         let caps = make_test_caps();
         let denials = vec![DenialRecord {
             path: PathBuf::from("/tmp/flood"),

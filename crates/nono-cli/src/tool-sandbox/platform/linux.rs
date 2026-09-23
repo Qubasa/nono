@@ -7566,6 +7566,10 @@ mod tests {
 
     #[test]
     fn outer_exec_gate_includes_env_shebang_reexec_target() -> Result<()> {
+        // Both lookups below resolve `sh` through PATH, which trojan tests rewrite.
+        let _env = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = Path::new("/usr/bin/env");
         if !env.is_file() {
             return Ok(());
