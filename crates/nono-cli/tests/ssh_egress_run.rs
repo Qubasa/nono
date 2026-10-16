@@ -847,7 +847,8 @@ fn ssh_allowance_reaches_the_allowed_endpoint_through_the_mediated_route() {
             sshd.target()
         )))
         .assert_success("the allowed endpoint must be reachable through the mediation")
-        .assert_stdout_contains("remote-command-ran");
+        .assert_stdout_contains("remote-command-ran")
+        .assert_stderr_lacks("ssh bastion session ended");
 }
 
 /// The remote exit status is the local exit status, which is what makes the

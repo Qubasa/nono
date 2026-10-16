@@ -843,9 +843,57 @@ pub(crate) async fn serve(
                 "ssh bastion session failed: {err}"
             )))
         })?;
-    running.await.map_err(|err| {
-        NonoError::Io(std::io::Error::other(format!(
-            "ssh bastion session ended: {err}"
-        )))
-    })
+    match running.await {
+        Ok(()) => Ok(()),
+        Err(err) if is_client_hangup(&err) => {
+            tracing::debug!("ssh bastion client closed the connection: {err}");
+            Ok(())
+        }
+        Err(err) => Err(NonoError::Io(std::io::Error::other(err))),
+    }
+}
+
+/// The sandboxed `ssh` dropping its transport without an SSH disconnect.
+///
+/// That is how OpenSSH and `git` normally leave once they are done, so it is
+/// the end of a session and not a fault worth a warning.
+fn is_client_hangup(err: &russh::Error) -> bool {
+    let russh::Error::IO(io) = err else {
+        return false;
+    };
+    matches!(
+        io.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_client_hangup;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn client_hangups_are_not_faults() {
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+        ] {
+            assert!(
+                is_client_hangup(&russh::Error::IO(Error::from(kind))),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_failures_stay_faults() {
+        assert!(!is_client_hangup(&russh::Error::IO(Error::from(
+            ErrorKind::PermissionDenied
+        ))));
+        assert!(!is_client_hangup(&russh::Error::InactivityTimeout));
+        assert!(!is_client_hangup(&russh::Error::Disconnect));
+    }
 }
