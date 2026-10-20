@@ -870,6 +870,33 @@ fn a_remote_command_exiting_seven_exits_seven_locally() {
         .assert_exit_code(7, "a relayed exit status must arrive unchanged");
 }
 
+/// The same through a ControlMaster, for a command that closes its output
+/// before it exits. sshd then sends EOF a second ahead of the exit status, and
+/// the master closes the channel on EOF. The status must still arrive instead
+/// of the client reporting 255.
+#[test]
+fn a_mux_client_keeps_the_exit_status_of_a_command_that_closed_its_output() {
+    let t = nono_test!("ssh-mux-exit");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let profile = t.write_profile("ssh-mux-exit", &filtered_profile(&sshd.allowance()));
+
+    mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "d=$(mktemp -d /tmp/nono-mux.XXXXXX) && \
+             ssh -o ControlMaster=yes -o ControlPersist=30 -o ControlPath=$d/m \
+               -p {port} {target} true && \
+             ssh -o ControlPath=$d/m -p {port} {target} \
+               'exec >&- 2>&-; sleep 1; exit 7' </dev/null; \
+             rc=$?; ssh -o ControlPath=$d/m -O exit {target} 2>/dev/null; \
+             rm -rf \"$d\"; exit $rc",
+            port = sshd.port,
+            target = sshd.target(),
+        )))
+        .assert_exit_code(7, "the exit status must survive the master closing on EOF");
+}
+
 /// The two streams stay two streams: `extended_data` is relayed as
 /// `extended_data`, not folded into the data channel.
 #[test]
