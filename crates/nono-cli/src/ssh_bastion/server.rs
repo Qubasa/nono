@@ -745,6 +745,13 @@ async fn forward_request(
 ///
 /// Every send is best-effort: the client closing first is normal rather than
 /// an error.
+///
+/// The remote's EOF is held until its exit status. sshd may send EOF first and
+/// the status only once the process has exited, and OpenSSH, as a mux master,
+/// closes the channel as soon as both directions have seen EOF. russh answers
+/// that close at once and forgets the channel, where sshd would have waited
+/// for the process, so a status relayed after it is dropped and the client
+/// reports 255 for a command that succeeded.
 async fn remote_pump(
     id: ChannelId,
     mut remote: ChannelReadHalf,
@@ -752,10 +759,27 @@ async fn remote_pump(
     target: SessionTarget,
     channels: Channels,
 ) {
+    let mut held_eof = false;
     while let Some(msg) = remote.wait().await {
-        if !relay_back(id, &handle, msg).await {
+        let releases_eof = match msg {
+            ChannelMsg::Eof => {
+                held_eof = true;
+                continue;
+            }
+            ChannelMsg::ExitStatus { .. } | ChannelMsg::ExitSignal { .. } => true,
+            _ => false,
+        };
+        let open = relay_back(id, &handle, msg).await;
+        if releases_eof && held_eof {
+            held_eof = false;
+            relay_back(id, &handle, ChannelMsg::Eof).await;
+        }
+        if !open {
             break;
         }
+    }
+    if held_eof {
+        relay_back(id, &handle, ChannelMsg::Eof).await;
     }
     // Retire the entry here rather than waiting for the client's close: until
     // it goes, every later request resolves to a pump with nothing on the
