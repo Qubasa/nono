@@ -1379,7 +1379,7 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub strict_broker_path: bool,
 
-    /// Linux sandbox enforcement mechanism [auto|landlock|external] (default: auto).
+    /// Linux sandbox enforcement mechanism [auto|landlock|external|namespace] (default: auto).
     ///
     /// auto     — Landlock plus a static seccomp baseline for restricted
     ///            networking, with fallback on ABI < V4. This is the default.
@@ -1387,6 +1387,8 @@ pub struct SandboxArgs {
     ///            cannot be satisfied without seccomp.
     /// external — Landlock still handles filesystem/process policy, while
     ///            TCP enforcement is delegated externally.
+    /// namespace — the child runs in a loopback-only network namespace and
+    ///            reaches the outside only through the proxy and SSH bastion.
     #[cfg(target_os = "linux")]
     #[arg(long, help_heading = "OPTIONS", value_name = "POLICY")]
     pub sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
