@@ -50,6 +50,7 @@ pub(super) struct Command<'a> {
     pub supervisor_fd: Option<RawFd>,
     pub pty_slave: Option<RawFd>,
     pub resource_procs: Option<RawFd>,
+    pub netns: Option<crate::child_netns::NetnsFds>,
     #[cfg(test)]
     pub fault: Fault,
 }
@@ -86,7 +87,7 @@ fn prepare(
         LinuxSandboxPolicy::Auto => {
             sandbox::prepare_seccomp_with_abi(caps, abi, nono::SeccompOpts::network_baseline())
         }
-        LinuxSandboxPolicy::External => {
+        LinuxSandboxPolicy::External | LinuxSandboxPolicy::Namespace => {
             sandbox::prepare_seccomp_with_abi(caps, abi, nono::SeccompOpts::external_tcp())
         }
         LinuxSandboxPolicy::Landlock => sandbox::prepare_landlock_with_abi(caps, abi),
@@ -334,6 +335,13 @@ fn child_exec(
         )
     } < 0
         || unsafe { libc::syscall(libc::SYS_getppid) } != parent_pid as libc::c_long
+    {
+        die(126);
+    }
+    // Before anything the parent inspects: joining changes the credentials
+    // that procfs access and the dumpable flag below are checked against.
+    if let Some(netns) = command.netns
+        && !netns.join()
     {
         die(126);
     }

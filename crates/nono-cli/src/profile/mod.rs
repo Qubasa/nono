@@ -2264,6 +2264,13 @@ pub enum LinuxSandboxPolicy {
     /// cgroups, systemd, etc.). nono still installs filesystem/process
     /// sandboxing and skips only its own TCP network lockdown.
     External,
+    /// The child runs in a user and network namespace of its own that holds
+    /// only loopback, and the supervisor stays outside it. Loopback inside is
+    /// unrestricted; the proxy port is forwarded in and listen/open ports are
+    /// forwarded back out to the parent's 127.0.0.1 by `pasta`, which must be
+    /// on PATH. There is no route out, so unrestricted networking and
+    /// `connect_port` are refused.
+    Namespace,
 }
 
 /// Linux-specific profile controls.

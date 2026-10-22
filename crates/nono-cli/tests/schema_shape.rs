@@ -1123,7 +1123,7 @@ fn test_schema_linux_config_matches_rust_model() {
 fn test_schema_validates_linux_sandbox_policy() {
     let schema = load_schema();
     let validator = jsonschema::validator_for(&schema).expect("schema compiles");
-    for policy in ["auto", "landlock", "external"] {
+    for policy in ["auto", "landlock", "external", "namespace"] {
         let profile = json!({ "linux": { "sandbox_policy": policy } });
         validator
             .validate(&profile)

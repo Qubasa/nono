@@ -304,6 +304,9 @@ pub struct ExecConfig<'a> {
     /// Linux network enforcement backend for this session.
     #[cfg(target_os = "linux")]
     pub sandbox_policy: crate::profile::LinuxSandboxPolicy,
+    /// Namespaces the child joins before exec under the `namespace` policy.
+    #[cfg(target_os = "linux")]
+    pub child_netns: Option<crate::child_netns::NetnsFds>,
     /// Allow-list of environment variable names. When set, only variables
     /// matching a glob pattern (e.g. `"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -986,6 +989,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 supervisor_fd: child_sock_fd,
                 pty_slave: pty_slave_fd,
                 resource_procs: resource_procs_fd,
+                netns: config.child_netns,
                 #[cfg(test)]
                 fault: clone_files::Fault::None,
             },
@@ -1010,6 +1014,23 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
 
     match fork_result {
         Ok(ForkResult::Child) => {
+            // Before the sandbox and anything else that depends on the
+            // credentials, which joining the user namespace replaces.
+            #[cfg(target_os = "linux")]
+            if let Some(netns) = config.child_netns
+                && !netns.join()
+            {
+                const MSG: &[u8] = b"nono: failed to join the child network namespace\n";
+                // SAFETY: async-signal-safe write and exit in the forked child.
+                unsafe {
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        MSG.as_ptr().cast::<libc::c_void>(),
+                        MSG.len(),
+                    );
+                    libc::_exit(126);
+                }
+            }
             #[cfg(target_os = "linux")]
             let mut child_caps = config.caps.clone();
             #[cfg(target_os = "linux")]
@@ -1171,6 +1192,10 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             Ok(fallback) => Sandbox::apply_external().map(|_| fallback),
                             Err(e) => Err(e),
                         }
+                    }
+                    // The namespace is the TCP boundary, entered above.
+                    crate::profile::LinuxSandboxPolicy::Namespace => {
+                        Sandbox::apply_seccomp(effective_caps, nono::SeccompOpts::external_tcp())
                     }
                 };
 

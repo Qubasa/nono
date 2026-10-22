@@ -57,6 +57,26 @@ pub(crate) fn spawn_owned(command: &mut Command) -> std::io::Result<OwnedChild> 
     Ok(OwnedChild(child))
 }
 
+/// A pid forked without [`Command`] whose exit status only its spawner reaps.
+///
+/// Dropping it deregisters the pid, so drop it only after reaping.
+pub(crate) struct OwnedPid(u32);
+
+impl Drop for OwnedPid {
+    fn drop(&mut self) {
+        owned().remove(&self.0);
+    }
+}
+
+/// Register a pid forked by hand.
+///
+/// Unlike [`spawn_owned`], the insert follows the fork, so register before the
+/// supervisor loop that drains orphans starts.
+pub(crate) fn own(pid: u32) -> OwnedPid {
+    owned().insert(pid);
+    OwnedPid(pid)
+}
+
 /// Run `drain` with the table locked, so no spawn can land mid-drain.
 pub(crate) fn with_owned<T>(drain: impl FnOnce(&HashSet<u32>) -> T) -> T {
     let table = owned();

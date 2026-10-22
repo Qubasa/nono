@@ -12,6 +12,8 @@ mod audit_integrity;
 mod audit_ledger;
 mod audit_session;
 mod capability_ext;
+#[cfg(target_os = "linux")]
+mod child_netns;
 mod child_reaper;
 mod cli;
 mod cli_bootstrap;

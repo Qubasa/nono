@@ -299,7 +299,7 @@ Each of these is refused before the sandbox starts:
 | `--block-net` with `--allow-ssh` | Contradictory: the mediated SSH route requires proxy mode. |
 | `--allow-net` with `--allow-ssh` | `--allow-net` bypasses the proxy entirely, so the destination pin could not apply. |
 | A host in both `allow_ssh` and `network.no_proxy` | `no_proxy` tells clients to go direct for that host, and there is no direct route: the endpoint is reachable only through the mediated session. |
-| Any configuration where the seccomp-notify supervisor is not installed | The supervisor is the destination pin. This covers `linux.sandbox_policy` of `landlock` or `external`, and WSL2, where seccomp notify returns `EBUSY`. Landlock filters by port only, so the "just this endpoint" allowance could not be kernel-enforced. |
+| Any configuration where the seccomp-notify supervisor is not installed | The supervisor is the destination pin. This covers `linux.sandbox_policy` of `landlock` or `external`, and WSL2, where seccomp notify returns `EBUSY`. Landlock filters by port only, so the "just this endpoint" allowance could not be kernel-enforced. `linux.sandbox_policy = "namespace"` is accepted: the child's network namespace has no route out, which pins egress to the proxy and the bastion on its own. |
 | `command_policies.commands` (Tool Sandbox) with `allow_ssh` | A tool-sandboxed child does not inherit nono's environment namespace, so `NONO_SSH_BASTION` is stripped, and neither `GIT_SSH_COMMAND` nor `RSYNC_RSH` is on the allowed list. The child would have no route to the mediation and every SSH session in it would fail, so nono refuses the combination rather than starting with a broken SSH route. |
 
 The refusal is keyed off whether the pin will actually be installed, not off a list of policy names, so `allow_ssh` on WSL2 is rejected outright rather than degrading through `security.wsl2_proxy_policy`. See [Credential Proxy on WSL2](/cli/internals/wsl2#credential-proxy-on-wsl2).
@@ -639,6 +639,24 @@ Landlock rules match TCP ports, not IP addresses: a plain `--allow-connect-port`
 The static baseline also denies `io_uring_setup()`. This prevents io_uring network operations from bypassing syscall filtering, but it also breaks workloads using io_uring only for ordinary file I/O.
 
 nono closes inherited descriptors before executing the target. Unix-domain IPC grants should nevertheless be treated as trusted channels: an allowed Unix peer can deliberately pass an already-connected Internet socket with `SCM_RIGHTS`, and neither a socket-creation filter nor Landlock's connect/bind hooks can retroactively restrict that connected descriptor.
+
+#### Network Namespace Policy
+
+`linux.sandbox_policy = "namespace"` (or `--sandbox-policy namespace`) moves the child into a user and network namespace of its own. The namespace holds a loopback interface and nothing else, so there is no route to any other host. nono's supervisor, proxy and SSH bastion stay in the network namespace nono was started in, and keep their own outbound access.
+
+Inside the namespace, loopback is unrestricted: the child may bind, listen on and connect to any port, and UDP works on loopback. Landlock's per-port TCP rules, the static seccomp socket baseline and the seccomp destination check are not installed, because the missing route already enforces what they approximate; filesystem and process sandboxing apply as under `auto`. Everything a client needs to reach is carried across by `pasta --splice-only`, which nono starts against the namespace:
+
+| Grant | Forwarded | Direction |
+|-------|-----------|-----------|
+| Proxy port | Always | Into the child, at the same port, so `HTTP(S)_PROXY` is unchanged |
+| `listen_port` / `listen_port_range` / `--listen-port` | While the child listens there | Out to the parent's `127.0.0.1` |
+| `open_port` / `open_port_range` / `--open-port` | While the side that serves it listens | In from the parent, or out from the child |
+
+Outward forwards bind `127.0.0.1` only, never other interfaces, and only once the child is listening, so the child cannot claim a parent-side port it is not serving. A server that listens only on `::1` inside the namespace is not forwarded.
+
+The policy refuses grants that would need a route out: unrestricted networking (no proxy and no `--block-net`), and `connect_port` / `--allow-connect-port`. With `--block-net` the child is offline with a working loopback. `pasta` must be on `PATH`; nono exits with an error rather than starting the child without its forwards.
+
+Pathname Unix sockets still cross the boundary, as filesystem objects; abstract Unix sockets do not, since they belong to the network namespace.
 
 ### macOS
 

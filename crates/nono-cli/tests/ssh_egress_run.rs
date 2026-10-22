@@ -10,7 +10,9 @@
 //! stand-in cannot tell `exec` from a port forward, so it cannot show that
 //! nono can. When no `sshd` is installed those tests skip rather than fail.
 //!
-//! Linux only: the destination pin is a seccomp user-notification supervisor.
+//! Linux only: the destination pin is a seccomp user-notification supervisor,
+//! or under `linux.sandbox_policy = "namespace"` a child network namespace
+//! with no route out.
 
 #![cfg(target_os = "linux")]
 
@@ -1277,6 +1279,190 @@ except OSError:
         .assert_stdout_contains("agent=unreachable")
         .assert_stdout_lacks("agent=no-env")
         .assert_stdout_contains("key=unreadable");
+}
+
+/// `linux.sandbox_policy = "namespace"`: the child gets loopback only, and the
+/// missing route out is what pins egress to the proxy and the bastion.
+const NAMESPACE: &str = r#""linux":{"sandbox_policy":"namespace"},"#;
+
+/// The namespace policy needs pasta to carry the proxy port into the child.
+fn pasta_available() -> bool {
+    if which("pasta").is_some() {
+        return true;
+    }
+    skip("pasta (passt) is not on PATH");
+    false
+}
+
+/// Loopback is the child's own and unrestricted, there is no route anywhere
+/// else, and the proxy is still there, still enforcing its allowlist.
+#[test]
+fn namespace_policy_frees_loopback_and_leaves_only_the_proxy() {
+    let Some(py) = python3_bin() else {
+        skip("no usable python3 available");
+        return;
+    };
+    if !pasta_available() {
+        return;
+    }
+    let t = nono_test!("netns-loopback");
+    let profile = t.write_profile(
+        "netns-loopback",
+        &profile_json_with(NAMESPACE, r#"{"allow_domain":["example.invalid"]}"#),
+    );
+
+    const PROBE: &str = r#"
+import errno, socket
+
+server = socket.socket()
+server.bind(("127.0.0.1", 0))
+server.listen()
+socket.create_connection(server.getsockname(), timeout=5)
+print("loopback=free")
+try:
+    socket.create_connection(("192.0.2.1", 80), timeout=5)
+    print("direct=connected")
+except OSError as err:
+    print("direct=" + errno.errorcode.get(err.errno, str(err.errno)))
+"#;
+    let script = format!("{PROBE}\n{}", connect_probe("not-allowed.invalid", 443));
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(py).arg("-c").arg(script))
+        .assert_success("the probe itself must run")
+        .assert_stdout_contains("loopback=free")
+        .assert_stdout_contains("direct=ENETUNREACH")
+        .assert_stdout_contains("STATUS HTTP/1.1 403");
+}
+
+/// A server the child starts on a `listen_port` is reachable from the
+/// parent's loopback, which is how a dev server reaches the user's browser.
+#[test]
+fn namespace_policy_forwards_a_listen_port_out_to_the_parent() {
+    let Some(py) = python3_bin() else {
+        skip("no usable python3 available");
+        return;
+    };
+    if !pasta_available() {
+        return;
+    }
+    let t = nono_test!("netns-listen");
+    let port = free_port();
+    let profile = t.write_profile(
+        "netns-listen",
+        &profile_json_with(
+            NAMESPACE,
+            &format!(r#"{{"allow_domain":["example.invalid"],"listen_port":[{port}]}}"#),
+        ),
+    );
+    // pasta notices the listener on its next scan, so keep knocking.
+    let knock = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+                let mut reply = String::new();
+                let _ = std::io::Read::read_to_string(&mut stream, &mut reply);
+                if !reply.is_empty() {
+                    return reply;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        String::new()
+    });
+
+    const SERVER: &str = r#"
+import socket
+
+server = socket.socket()
+server.bind(("127.0.0.1", @PORT@))
+server.listen()
+server.settimeout(20)
+conn, _ = server.accept()
+conn.sendall(b"served-from-the-namespace")
+conn.close()
+print("accepted")
+"#;
+    t.run()
+        .profile(&profile)
+        .exec(
+            Argv::new(py)
+                .arg("-c")
+                .arg(SERVER.replace("@PORT@", &port.to_string())),
+        )
+        .assert_success("the parent must reach the child's listener")
+        .assert_stdout_contains("accepted");
+    assert_eq!(
+        knock.join().expect("knock thread"),
+        "served-from-the-namespace"
+    );
+}
+
+/// An `open_port` service running outside is still reachable from inside.
+#[test]
+fn namespace_policy_forwards_an_open_port_in_from_the_parent() {
+    let Some(py) = python3_bin() else {
+        skip("no usable python3 available");
+        return;
+    };
+    if !pasta_available() {
+        return;
+    }
+    let server = BannerServer::start();
+    let t = nono_test!("netns-open");
+    let profile = t.write_profile(
+        "netns-open",
+        &profile_json_with(
+            NAMESPACE,
+            &format!(
+                r#"{{"allow_domain":["example.invalid"],"open_port":[{}]}}"#,
+                server.port
+            ),
+        ),
+    );
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(py).arg("-c").arg(format!(
+            "import socket; print(socket.create_connection(('127.0.0.1', {}), timeout=5).recv(32))",
+            server.port
+        )))
+        .assert_success("the parent's open_port service must be reachable")
+        .assert_stdout_contains("SSH-2.0-nono-test");
+}
+
+/// The bastion lives in the parent, outside the namespace, and reaches the
+/// endpoint from there. With no route out of the child, the namespace is the
+/// destination pin, so `allow_ssh` is accepted without the seccomp supervisor.
+#[test]
+fn namespace_policy_reaches_the_allowed_ssh_endpoint_through_the_bastion() {
+    if !pasta_available() {
+        return;
+    }
+    let t = nono_test!("netns-ssh");
+    let state = ShortState::new(&t);
+    let Some(sshd) = Sshd::start(&t) else { return };
+    let profile = t.write_profile(
+        "netns-ssh",
+        &profile_json_with(
+            NAMESPACE,
+            &format!(
+                r#"{{"allow_domain":["example.invalid"],"allow_ssh":["{}"]}}"#,
+                sshd.allowance()
+            ),
+        ),
+    );
+
+    mediated(&t, &state, &sshd)
+        .profile(&profile)
+        .exec(shell(&format!(
+            "ssh -p {} {} 'echo remote-command-ran'",
+            sshd.port,
+            sshd.target()
+        )))
+        .assert_success("the allowed endpoint must be reachable from the namespace")
+        .assert_stdout_contains("remote-command-ran");
 }
 
 /// The relay is only a client: without a bastion to speak to it must fail, and

@@ -1231,6 +1231,7 @@ Profiles can set this via `capability_elevation` in their security config. The C
 | `auto` | Landlock plus a static seccomp baseline for restricted networking, with automatic fallback when the kernel ABI lacks network support (< v4). **Default.** |
 | `landlock` | Landlock only. Returns an error at startup if the running kernel cannot satisfy TCP restrictions via Landlock alone. Because Landlock network rules cover TCP only, this explicit mode does not block UDP. |
 | `external` | Delegate TCP network lockdown to the deployment. nono still installs filesystem/process sandboxing, but skips its own localhost/proxy-port network enforcement. Use only when infrastructure such as iptables, cgroups, systemd units, or container policy forces egress through the proxy. |
+| `namespace` | Run the child in its own user and network namespace that holds only loopback, while nono's proxy and SSH bastion stay outside it. Loopback inside is unrestricted; the missing route out is the egress lockdown. Requires `pasta` (from the passt project) on `PATH`. See [Network Namespace Policy](/cli/features/networking#network-namespace-policy). |
 
 ```bash
 # Require Landlock-only enforcement; fail if the kernel can't satisfy it
@@ -1238,6 +1239,9 @@ nono run --sandbox-policy landlock --allow-cwd -- my-agent
 
 # Declare that network enforcement is external; nono still applies FS/process sandboxing
 nono run --sandbox-policy external --allow-cwd -- my-agent
+
+# Loopback-only network namespace: dev servers bind any port, egress goes through the proxy
+nono run --sandbox-policy namespace --network-profile developer --listen-port 5173 --allow-cwd -- npm run dev
 ```
 
 The policy can also be set in a profile under `linux.sandbox_policy`. The CLI flag overrides the profile value. This setting is supported only by `nono run`; `nono shell` and `nono wrap` reject profiles that contain `linux.sandbox_policy`. On macOS and other non-Linux platforms this flag is not available.

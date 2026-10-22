@@ -50,6 +50,16 @@ fn apply_pre_fork_sandbox(
                     )?;
                     Sandbox::apply_external()?;
                 }
+                // Direct mode execs nono itself into the command, leaving no
+                // parent outside the namespace to hold the proxy or pasta.
+                LinuxSandboxPolicy::Namespace => {
+                    return Err(NonoError::SandboxInit(
+                        "linux.sandbox_policy = \"namespace\" needs a supervisor that stays \
+                         outside the child's network namespace; use `nono run` instead of \
+                         `nono wrap`."
+                            .to_string(),
+                    ));
+                }
             }
         }
 
@@ -59,6 +69,35 @@ fn apply_pre_fork_sandbox(
         }
     }
     Ok(())
+}
+
+/// Why nothing will pin the child's outbound connections to the proxy, or
+/// `None` when something does: the seccomp-notify supervisor, or a network
+/// namespace that has no route out at all.
+#[cfg(target_os = "linux")]
+fn unpinned_egress_cause(
+    policy: crate::profile::LinuxSandboxPolicy,
+    seccomp_proxy_fallback: bool,
+) -> Option<&'static str> {
+    use crate::profile::LinuxSandboxPolicy;
+    if seccomp_proxy_fallback {
+        return None;
+    }
+    match policy {
+        LinuxSandboxPolicy::Namespace => None,
+        LinuxSandboxPolicy::Landlock => Some(
+            "linux.sandbox_policy = \"landlock\" opts out of the seccomp \
+             user-notification supervisor",
+        ),
+        LinuxSandboxPolicy::External => Some(
+            "linux.sandbox_policy = \"external\" opts out of the seccomp \
+             user-notification supervisor",
+        ),
+        LinuxSandboxPolicy::Auto => Some(
+            "this kernel runs the sandbox without the seccomp user-notification \
+             supervisor (WSL2 returns EBUSY for seccomp notify listeners)",
+        ),
+    }
 }
 
 fn cleanup_capability_state_file(cap_file_path: &std::path::Path) {
@@ -641,6 +680,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             flags.sandbox_policy,
             crate::profile::LinuxSandboxPolicy::External
                 | crate::profile::LinuxSandboxPolicy::Landlock
+                | crate::profile::LinuxSandboxPolicy::Namespace
         );
         if no_seccomp_fallback {
             false
@@ -683,32 +723,18 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         }
     };
 
-    // `allow_ssh` promises "only this endpoint"; the seccomp-notify destination
-    // pin is what makes that true. Key the refusal off whether the pin will
-    // actually be installed, not off the policy names that skip it, so a new
-    // opt-out cannot reopen this hole silently.
+    // `allow_ssh` promises "only this endpoint"; something must pin outbound
+    // connections to the proxy for that to be true. Key the refusal off whether
+    // a pin will actually be in place, not off the policy names that skip it,
+    // so a new opt-out cannot reopen this hole silently.
     #[cfg(target_os = "linux")]
-    if !seccomp_proxy_fallback
+    if let Some(cause) = unpinned_egress_cause(flags.sandbox_policy, seccomp_proxy_fallback)
         && flags
             .network
             .proxy_options()
             .and_then(|opts| opts.domain_filter.as_ref())
             .is_some_and(|filter| !filter.allow_ssh.is_empty())
     {
-        let cause = match flags.sandbox_policy {
-            crate::profile::LinuxSandboxPolicy::Landlock => {
-                "linux.sandbox_policy = \"landlock\" opts out of the seccomp \
-                 user-notification supervisor"
-            }
-            crate::profile::LinuxSandboxPolicy::External => {
-                "linux.sandbox_policy = \"external\" opts out of the seccomp \
-                 user-notification supervisor"
-            }
-            crate::profile::LinuxSandboxPolicy::Auto => {
-                "this kernel runs the sandbox without the seccomp user-notification \
-                 supervisor (WSL2 returns EBUSY for seccomp notify listeners)"
-            }
-        };
         return Err(NonoError::SandboxInit(format!(
             "network.allow_ssh cannot be kernel-enforced here: {cause}.\n\n\
              That supervisor is what pins outbound connections to the proxy; Landlock \
@@ -738,6 +764,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 .to_string(),
         ));
     }
+
+    // Kept alive until the child is gone: dropping it removes the namespaces'
+    // holder and with it pasta's forwards.
+    #[cfg(target_os = "linux")]
+    let child_netns = if flags.sandbox_policy == crate::profile::LinuxSandboxPolicy::Namespace {
+        let forwards = crate::child_netns::Forwards::from_caps(&caps)?;
+        Some(crate::child_netns::ChildNetns::start(&forwards)?)
+    } else {
+        None
+    };
 
     let config = exec_strategy::ExecConfig {
         command: &command,
@@ -785,6 +821,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         },
         #[cfg(target_os = "linux")]
         sandbox_policy: flags.sandbox_policy,
+        #[cfg(target_os = "linux")]
+        child_netns: child_netns
+            .as_ref()
+            .map(crate::child_netns::ChildNetns::fds),
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         case_insensitive_env_vars: flags.case_insensitive_env_vars,

@@ -675,8 +675,8 @@
     },
     "LinuxSandboxPolicy": {
       "type": "string",
-      "enum": ["auto", "landlock", "external"],
-      "description": "Which sandboxing mechanism nono installs on Linux. 'auto' (default): Landlock plus a static seccomp network baseline, with automatic seccomp fallback when the kernel ABI lacks Landlock network support (< V4). 'landlock': Landlock only; errors at startup if the kernel cannot satisfy network restrictions via Landlock alone. 'external': TCP network egress enforcement is managed externally (iptables, cgroups, systemd, etc.); nono still installs filesystem/process sandboxing and skips only its own TCP network lockdown."
+      "enum": ["auto", "landlock", "external", "namespace"],
+      "description": "Which sandboxing mechanism nono installs on Linux. 'auto' (default): Landlock plus a static seccomp network baseline, with automatic seccomp fallback when the kernel ABI lacks Landlock network support (< V4). 'landlock': Landlock only; errors at startup if the kernel cannot satisfy network restrictions via Landlock alone. 'external': TCP network egress enforcement is managed externally (iptables, cgroups, systemd, etc.); nono still installs filesystem/process sandboxing and skips only its own TCP network lockdown. 'namespace': the child runs in its own user and network namespace holding only loopback, unrestricted inside; pasta (on PATH) forwards the proxy port in and listen/open ports out to the parent's 127.0.0.1. Refuses unrestricted networking and connect_port, which need a route out."
     },
     "ProfileSignalMode": {
       "type": "string",
